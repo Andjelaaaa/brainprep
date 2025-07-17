@@ -37,65 +37,64 @@ def is_excluded(path, patterns, root):
 
 def process_dir(root, glob_suffix, layout, args):
     print(f"Processing {root}")
-    # load excludes
+    # load raw excludes
     yaml_file = os.path.join(root, args.exclude_file)
     raw = load_excludes(yaml_file) if os.path.exists(yaml_file) else []
-    # split excludes
+    # separate run-level and generic excludes
     runs = [e for e in raw if '_run-' in e]
     gens = [e for e in raw if '_run-' not in e]
-    # build exclude patterns for generic
     patterns = expand_excludes(gens)
-        # add run-level excludes to patterns
+    # add run-level exact patterns
     for run_id in runs:
-        # derive session directory from run_id
-        # run_id example: 'sub-002081_ses-13mo_run-001'
         session_key, _ = run_id.rsplit('_run-', 1)
         session_path = session_key.replace('_ses-', '/ses-')
-        if args.modality in ('T1w', 'T2w'):
-            # exclude the exact run NIfTI under anat
-            patterns.append(f"{session_path}/anat/{run_id}_{args.modality}.nii.gz")
-        else:
-            patterns.append(f"**/{run_id}_*.nii.gz")
+        pat = f"{session_path}/anat/{run_id}_{args.modality}.nii.gz" if args.modality in ('T1w','T2w') else f"**/{run_id}_*.nii.gz"
+        patterns.append(pat)
 
     found = set()
-    # restricted search for T1w/T2w in anat dirs
+    # scan anatomicals for T1w/T2w only
     if args.modality in ('T1w', 'T2w'):
-        # choose anat folder pattern based on layout
+        # identify anat dirs by layout
         if layout == 'long':
             anat_glob = os.path.join(root, 'sub-*', 'ses-*', 'anat')
         else:
             anat_glob = os.path.join(root, 'sub-*', 'anat')
         for ad in glob.glob(anat_glob):
-            # get session age and skip if <12mo
+            # parse session label
             parts = ad.replace(os.sep, '/').split('/')
-            # find 'ses-XXmo' in parts
-            ses_part = next((p for p in parts if p.startswith('ses-') and p.endswith('mo')), None)
+            ses_part = next((p for p in parts if p.startswith('ses-') and (p.endswith('mo') or p.endswith('wk'))), None)
             if ses_part:
+                # skip all weeks
+                if ses_part.endswith('wk'):
+                    continue
+                # skip months <12
                 try:
-                    age = int(ses_part.replace('ses-','').replace('mo',''))
+                    age = int(ses_part[len('ses-'):-len('mo')])
                     if age < 12:
                         continue
                 except ValueError:
-                    pass
-            # now scan images
+                    continue
+            # scan files
             for img in glob.glob(os.path.join(ad, f'*_{args.modality}.nii.gz')):
                 if is_excluded(img, patterns, root):
                     continue
                 found.add(img)
     else:
-        # full recursive search, also skip sessions <12mo
+        # full recursive scan for other modalities
         for img in glob.glob(os.path.join(root, glob_suffix), recursive=True):
-            # skip sessions <12mo in path
-            rel = os.path.relpath(img, root).replace(os.sep, '/')
+            # skip any wk sessions
+            rel = os.path.relpath(img, root).replace(os.sep,'/')
             parts = rel.split('/')
-            ses_part = next((p for p in parts if p.startswith('ses-') and p.endswith('mo')), None)
+            ses_part = next((p for p in parts if p.startswith('ses-') and (p.endswith('mo') or p.endswith('wk'))), None)
             if ses_part:
+                if ses_part.endswith('wk'):
+                    continue
                 try:
-                    age = int(ses_part.replace('ses-','').replace('mo',''))
+                    age = int(ses_part[len('ses-'):-len('mo')])
                     if age < 12:
                         continue
                 except ValueError:
-                    pass
+                    continue
             if is_excluded(img, patterns, root):
                 continue
             found.add(img)
@@ -104,36 +103,33 @@ def process_dir(root, glob_suffix, layout, args):
     return found
 
 if __name__ == '__main__':
-    p = argparse.ArgumentParser(description="List BIDS images with per-dataset layout")
-    p.add_argument('bids_dirs', nargs='+', help="BIDS root directories")
-    p.add_argument('-l', '--layouts', nargs='+', choices=['long', 'cross'],
-                   required=True, help="Layout for each dir: 'long' or 'cross'")
-    p.add_argument('-e', '--exclude-file', default='exclude.yaml',
-                   help="YAML file listing identifiers to skip")
-    p.add_argument('-m', '--modality', choices=['T1w', 'T2w', 'FLAIR', 'bold', 'dwi'],
-                   help="Suffix to include, e.g. T1w, dwi")
-    p.add_argument('-p', '--pattern', default=None,
-                   help="Override glob pattern for non-T1w/T2w")
-    p.add_argument('-o', '--output', required=True, help="Output .txt file")
-    args = p.parse_args()
-
+    parser = argparse.ArgumentParser(description="List BIDS images with per-dataset layout")
+    parser.add_argument('bids_dirs', nargs='+', help="BIDS root directories")
+    parser.add_argument('-l', '--layouts', nargs='+', choices=['long','cross'], required=True,
+                        help="Layout per dir: 'long' or 'cross'")
+    parser.add_argument('-e', '--exclude-file', default='exclude.yaml',
+                        help="YAML file listing identifiers to skip")
+    parser.add_argument('-m', '--modality', choices=['T1w','T2w','FLAIR','bold','dwi'],
+                        help="Suffix to include, e.g. T1w, dwi")
+    parser.add_argument('-p', '--pattern', default=None,
+                        help="Override glob pattern for non-anat scans")
+    parser.add_argument('-o', '--output', required=True, help="Output .txt file")
+    args = parser.parse_args()
     if len(args.layouts) != len(args.bids_dirs):
-        p.error("--layouts must match number of BIDS dirs")
+        parser.error("--layouts must match number of bids_dirs")
 
+    # choose fallback glob
     final = set()
     for root, layout in zip(args.bids_dirs, args.layouts):
         root = os.path.abspath(root)
-        # determine recursive pattern for non-anat cases
         if args.pattern:
             glob_s = args.pattern
-        elif args.modality not in ('T1w', 'T2w') and args.modality:
+        elif args.modality not in ('T1w','T2w') and args.modality:
             glob_s = f"sub-*/ses-*/*/*_{args.modality}.nii.gz" if layout=='long' else f"sub-*/*/*_{args.modality}.nii.gz"
         else:
             glob_s = '**/*.nii.gz'
-
         final |= process_dir(root, glob_s, layout, args)
 
     print(f"Writing {len(final)} paths to {args.output}")
     with open(args.output, 'w') as out:
-        for pth in sorted(final):
-            out.write(pth + '\n')
+        for pth in sorted(final): out.write(pth+'\n')
