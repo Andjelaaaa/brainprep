@@ -40,42 +40,64 @@ def process_dir(root, glob_suffix, layout, args):
     # load excludes
     yaml_file = os.path.join(root, args.exclude_file)
     raw = load_excludes(yaml_file) if os.path.exists(yaml_file) else []
+    # split excludes
     runs = [e for e in raw if '_run-' in e]
     gens = [e for e in raw if '_run-' not in e]
+    # build exclude patterns for generic
     patterns = expand_excludes(gens)
+        # add run-level excludes to patterns
+    for run_id in runs:
+        # derive session directory from run_id
+        # run_id example: 'sub-002081_ses-13mo_run-001'
+        session_key, _ = run_id.rsplit('_run-', 1)
+        session_path = session_key.replace('_ses-', '/ses-')
+        if args.modality in ('T1w', 'T2w'):
+            # exclude the exact run NIfTI under anat
+            patterns.append(f"{session_path}/anat/{run_id}_{args.modality}.nii.gz")
+        else:
+            patterns.append(f"**/{run_id}_*.nii.gz")
 
     found = set()
-    # restrict T1w/T2w to anat dirs based on layout
+    # restricted search for T1w/T2w in anat dirs
     if args.modality in ('T1w', 'T2w'):
+        # choose anat folder pattern based on layout
         if layout == 'long':
             anat_glob = os.path.join(root, 'sub-*', 'ses-*', 'anat')
         else:
             anat_glob = os.path.join(root, 'sub-*', 'anat')
-        anat_dirs = glob.glob(anat_glob)
-        for ad in anat_dirs:
+        for ad in glob.glob(anat_glob):
+            # get session age and skip if <12mo
+            parts = ad.replace(os.sep, '/').split('/')
+            # find 'ses-XXmo' in parts
+            ses_part = next((p for p in parts if p.startswith('ses-') and p.endswith('mo')), None)
+            if ses_part:
+                try:
+                    age = int(ses_part.replace('ses-','').replace('mo',''))
+                    if age < 12:
+                        continue
+                except ValueError:
+                    pass
+            # now scan images
             for img in glob.glob(os.path.join(ad, f'*_{args.modality}.nii.gz')):
-                if patterns and is_excluded(img, patterns, root):
+                if is_excluded(img, patterns, root):
                     continue
                 found.add(img)
     else:
-        # full recursive search
+        # full recursive search, also skip sessions <12mo
         for img in glob.glob(os.path.join(root, glob_suffix), recursive=True):
-            if patterns and is_excluded(img, patterns, root):
+            # skip sessions <12mo in path
+            rel = os.path.relpath(img, root).replace(os.sep, '/')
+            parts = rel.split('/')
+            ses_part = next((p for p in parts if p.startswith('ses-') and p.endswith('mo')), None)
+            if ses_part:
+                try:
+                    age = int(ses_part.replace('ses-','').replace('mo',''))
+                    if age < 12:
+                        continue
+                except ValueError:
+                    pass
+            if is_excluded(img, patterns, root):
                 continue
-            found.add(img)
-
-    # re-add explicit runs
-    for run_id in runs:
-        if args.modality in ('T1w', 'T2w'):
-            if layout == 'long':
-                pat = os.path.join(root, 'sub-*', 'ses-*', 'anat', f"{run_id}_{args.modality}.nii.gz")
-            else:
-                pat = os.path.join(root, 'sub-*', 'anat', f"{run_id}_{args.modality}.nii.gz")
-            matches = glob.glob(pat)
-        else:
-            pat = os.path.join(root, f"**/{run_id}_{args.modality}.nii.gz") if args.modality else os.path.join(root, f"**/{run_id}_*.nii.gz")
-            matches = glob.glob(pat, recursive=True)
-        for img in matches:
             found.add(img)
 
     print(f"  found {len(found)} images")
