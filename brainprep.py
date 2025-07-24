@@ -110,6 +110,8 @@ def parse_bids_info(path):
         dataset = "hc-bcp"
     elif "hc-calgary-preschool" in path:
         dataset = "hc-calgary-preschool"
+    elif "ping" in path:
+        dataset = "hc-ping"
     elif "mtbi-koala" in path:
         dataset = "mtbi-koala"
 
@@ -149,7 +151,7 @@ def get_step_paths(input_nifti, preproc_dir, template_name=None):
 
     deriv_root = os.path.join(preproc_dir, "derivatives", template_name, dataset)
 
-    if dataset == "mtbi-koala":
+    if dataset == "mtbi-koala" or "hc-ping":
         step1_dir = os.path.join(deriv_root, "01_n4",                sub_id, "anat")
         step2_dir = os.path.join(deriv_root, "02_synthstrip",        sub_id, "anat")
         step3_dir = os.path.join(deriv_root, "03_affine_registration", sub_id, "anat")
@@ -279,7 +281,14 @@ if __name__ == "__main__":
 
             # read input lines
             with open(inp_file, 'r') as f:
-                inp_list = [l.strip() for l in f.readlines()]
+                inp_list = []
+                for line in f:
+                    p = line.strip()
+                    # remove leading + trailing quotes if present
+                    if p.startswith('"') and p.endswith('"'):
+                        p = p[1:-1]
+                    inp_list.append(p)
+
 
             nbc_list = set()
             if args.no_bfc and os.path.exists(args.no_bfc):
@@ -320,8 +329,8 @@ if __name__ == "__main__":
 
                 # BIAS-FIELD CORRECTION
                 if corr_nii != input_path and not os.path.exists(corr_nii):
-                    cmd = (f'N4BiasFieldCorrection -d 3 -i {input_path} '
-                        f'-o {corr_nii} '
+                    cmd = (f'N4BiasFieldCorrection -d 3 -i "{input_path}" '
+                        f'-o "{corr_nii}" '
                         f'-s {shrinkf} -v > /dev/null')
                     os.system(cmd)
                 if not os.path.exists(corr_nii):
@@ -330,7 +339,7 @@ if __name__ == "__main__":
 
                 # SynthStrip with a mask output
                 if not os.path.exists(skull_nii):
-                    os.system(f'mri_synthstrip -i {corr_nii} -o {skull_nii} -m {subj_mask}')#--gpu > /dev/null')
+                    os.system(f'mri_synthstrip -i "{corr_nii}" -o {skull_nii} -m {subj_mask}')#--gpu > /dev/null')
                 if not os.path.exists(skull_nii):
                     print(f"[ERROR] SynthStrip failed for {input_path}")
                     continue

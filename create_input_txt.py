@@ -132,4 +132,4 @@ if __name__ == '__main__':
 
     print(f"Writing {len(final)} paths to {args.output}")
     with open(args.output, 'w') as out:
-        for pth in sorted(final): out.write(pth+'\n')
+        for pth in sorted(final): out.write(f'"{pth}"\n')

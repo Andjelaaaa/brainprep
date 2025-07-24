@@ -1,5 +1,13 @@
 .vscode/
 to_preprocess_T1w.txt
+derivatives/
+environment.yml
+preprocessing_log.txt
+templates/
+to_preprocess_ping.txt
+
+
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
