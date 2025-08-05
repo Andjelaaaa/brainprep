@@ -110,22 +110,24 @@ def parse_bids_info(path):
         dataset = "hc-bcp"
     elif "hc-calgary-preschool" in path:
         dataset = "hc-calgary-preschool"
+    elif "daufin" in path:
+        dataset = "hc-daufin"
     elif "ping" in path:
         dataset = "hc-ping"
     elif "mtbi-koala" in path:
         dataset = "mtbi-koala"
 
-    parts = re.split(r"[\/_]", path)
-    sub_id = None
-    ses_id = None
-    run_id = None
-    for p in parts:
-        if p.startswith("sub-"):
-            sub_id = p
-        elif p.startswith("ses-"):
-            ses_id = p
-        elif p.startswith("run-"):
-            run_id = p
+    m = re.search(r"(sub-[^/]+)", path)
+    if m:
+        sub_id = m.group(1)    # gives "sub-CTL_01"
+    else:
+        sub_id = None
+
+    m = re.search(r"(ses-[^/]+)", path)
+    ses_id = m.group(1) if m else None
+
+    m = re.search(r"(run-[^/]+)", path)
+    run_id = m.group(1) if m else None
 
     return dataset, sub_id, ses_id, run_id
 
@@ -151,7 +153,7 @@ def get_step_paths(input_nifti, preproc_dir, template_name=None):
 
     deriv_root = os.path.join(preproc_dir, "derivatives", template_name, dataset)
 
-    if dataset == "mtbi-koala" or "hc-ping":
+    if dataset == "mtbi-koala" or "hc-ping" or "hc-daufin":
         step1_dir = os.path.join(deriv_root, "01_n4",                sub_id, "anat")
         step2_dir = os.path.join(deriv_root, "02_synthstrip",        sub_id, "anat")
         step3_dir = os.path.join(deriv_root, "03_affine_registration", sub_id, "anat")
@@ -239,43 +241,47 @@ def get_step_paths(input_nifti, preproc_dir, template_name=None):
 ################################################################################
 
 if __name__ == "__main__":
-    logfile_path = "preprocessing_log.txt"
+     
+    start_time = time.time()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--inputs', required=True,
+                        help='text file with paths to T1w images (one per line)')
+    parser.add_argument('--template', required=True,
+                        help='template image for antsRegistrationSyNQuick.sh')
+    parser.add_argument('-m', '--modality', default='t1', help='Modality for WhiteStripe')
+    parser.add_argument('-t', '--threads', type=int, default=NPROC, help='threads (default: all cores)')
+    parser.add_argument('-s', '--shrink-factor', type=int, default=4, help='N4 shrink factor (default=4)')
+    parser.add_argument('-r', '--registration-type', type=str, default='a',
+                        help='ANTS reg type {t,r,a} (default=a=affine)')
+    parser.add_argument('--no-bfc', type=str,
+                        help='text file with input paths for which to skip bias field correction')
+    parser.add_argument('--keep', action='store_true',
+                        help='Keep intermediate files')
+    parser.add_argument('--preproc-dir', default='preproces_bcp_cp',
+                        help='Top-level folder for derivatives (default=preproces_bcp_cp)')
+    parser.add_argument('--template-mask', type=str, default=None,
+                    help='Optional template-space brain mask (used instead of transforming subject mask)')
+    parser.add_argument('--dataset', type=str, default=None,
+                    help='Name of dataset to be preprocessed')
+
+
+    args = parser.parse_args()
+    inp_file = args.inputs
+    template = args.template
+
+    threads  = args.threads
+    shrinkf  = args.shrink_factor
+    regtype  = args.registration_type
+    keepint  = args.keep
+    preproc_dir = args.preproc_dir
+    dataset_name = args.dataset
+    
+    logfile_path = f"preprocessing_log_{dataset_name}.txt"
     tee = TeeLogger(logfile_path)
 
     sys.stdout = tee
     with redirect_stderr(tee):
-        try: 
-            start_time = time.time()
-            parser = argparse.ArgumentParser()
-            parser.add_argument('--inputs', required=True,
-                                help='text file with paths to T1w images (one per line)')
-            parser.add_argument('--template', required=True,
-                                help='template image for antsRegistrationSyNQuick.sh')
-            parser.add_argument('-m', '--modality', default='t1', help='Modality for WhiteStripe')
-            parser.add_argument('-t', '--threads', type=int, default=NPROC, help='threads (default: all cores)')
-            parser.add_argument('-s', '--shrink-factor', type=int, default=4, help='N4 shrink factor (default=4)')
-            parser.add_argument('-r', '--registration-type', type=str, default='a',
-                                help='ANTS reg type {t,r,a} (default=a=affine)')
-            parser.add_argument('--no-bfc', type=str,
-                                help='text file with input paths for which to skip bias field correction')
-            parser.add_argument('--keep', action='store_true',
-                                help='Keep intermediate files')
-            parser.add_argument('--preproc-dir', default='preproces_bcp_cp',
-                                help='Top-level folder for derivatives (default=preproces_bcp_cp)')
-            parser.add_argument('--template-mask', type=str, default=None,
-                            help='Optional template-space brain mask (used instead of transforming subject mask)')
-
-
-            args = parser.parse_args()
-            inp_file = args.inputs
-            template = args.template
-
-            threads  = args.threads
-            shrinkf  = args.shrink_factor
-            regtype  = args.registration_type
-            keepint  = args.keep
-            preproc_dir = args.preproc_dir
-
+        try:
             # if args.template_mask and "nihpd" in template:
             #     print(f"📌 Using non-skull-stripped image for registration and template mask for brain extraction.")
 
@@ -481,11 +487,19 @@ if __name__ == "__main__":
                     for r, s in reg_seg_pairs:
                         f_in.write(r + "\n")
                         f_out.write(s + "\n")
+                with open("temp-qc.txt", "w") as f_qc, open("temp-vol.txt", "w") as f_vol:
+                    for r, s in reg_seg_pairs:
+                        vol_csv = s.replace("_segm.nii.gz", "_vol.csv")
+                        f_vol.write(vol_csv + "\n")
+                        qc_csv = s.replace("_segm.nii.gz", "_qc.csv")
+                        f_qc.write(qc_csv + "\n")
 
                 # Run SynthSeg (multiple images mode)
-                os.system(f'mri_synthseg --i temp-input.txt --o temp-output.txt --threads {threads} --cpu')
+                os.system(f'mri_synthseg --i temp-input.txt --o temp-output.txt --vol temp-vol.txt --qc temp-qc.txt --threads {threads} --cpu')
                 os.remove("temp-input.txt")
                 os.remove("temp-output.txt")
+                os.remove("temp-vol.txt")
+                os.remove("temp-qc.txt")
 
             # Check success
             for inp, sp in list(outputs_dict.items()):

@@ -61,19 +61,19 @@ def process_dir(root, glob_suffix, layout, args):
             anat_glob = os.path.join(root, 'sub-*', 'anat')
         for ad in glob.glob(anat_glob):
             # parse session label
-            parts = ad.replace(os.sep, '/').split('/')
-            ses_part = next((p for p in parts if p.startswith('ses-') and (p.endswith('mo') or p.endswith('wk'))), None)
-            if ses_part:
-                # skip all weeks
-                if ses_part.endswith('wk'):
-                    continue
-                # skip months <12
-                try:
-                    age = int(ses_part[len('ses-'):-len('mo')])
-                    if age < 12:
+            if args.min_age_months is not None:
+                rel = os.path.relpath(img, root).replace(os.sep,'/')
+                parts = rel.split('/')
+                ses_part = next((p for p in parts if p.startswith('ses-') and (p.endswith('mo') or p.endswith('wk'))), None)
+                if ses_part:
+                    if ses_part.endswith('wk'):
                         continue
-                except ValueError:
-                    continue
+                    try:
+                        age = int(ses_part[len('ses-'):-len('mo')])
+                        if age < args.min_age_months:
+                            continue
+                    except ValueError:
+                        continue
             # scan files
             for img in glob.glob(os.path.join(ad, f'*_{args.modality}.nii.gz')):
                 if is_excluded(img, patterns, root):
@@ -82,19 +82,19 @@ def process_dir(root, glob_suffix, layout, args):
     else:
         # full recursive scan for other modalities
         for img in glob.glob(os.path.join(root, glob_suffix), recursive=True):
-            # skip any wk sessions
-            rel = os.path.relpath(img, root).replace(os.sep,'/')
-            parts = rel.split('/')
-            ses_part = next((p for p in parts if p.startswith('ses-') and (p.endswith('mo') or p.endswith('wk'))), None)
-            if ses_part:
-                if ses_part.endswith('wk'):
-                    continue
-                try:
-                    age = int(ses_part[len('ses-'):-len('mo')])
-                    if age < 12:
+            if args.min_age_months is not None:
+                rel = os.path.relpath(img, root).replace(os.sep,'/')
+                parts = rel.split('/')
+                ses_part = next((p for p in parts if p.startswith('ses-') and (p.endswith('mo') or p.endswith('wk'))), None)
+                if ses_part:
+                    if ses_part.endswith('wk'):
                         continue
-                except ValueError:
-                    continue
+                    try:
+                        age = int(ses_part[len('ses-'):-len('mo')])
+                        if age < args.min_age_months:
+                            continue
+                    except ValueError:
+                        continue
             if is_excluded(img, patterns, root):
                 continue
             found.add(img)
@@ -103,6 +103,8 @@ def process_dir(root, glob_suffix, layout, args):
     return found
 
 if __name__ == '__main__':
+    # Example command:
+    # python create_input_txt.py "/home/andjela/joplin-intra-inter/hc-bcp" -l long --modality T1w -e exclude.yaml -o to_preprocess_bcp_all_except_exclude.txt
     parser = argparse.ArgumentParser(description="List BIDS images with per-dataset layout")
     parser.add_argument('bids_dirs', nargs='+', help="BIDS root directories")
     parser.add_argument('-l', '--layouts', nargs='+', choices=['long','cross'], required=True,
@@ -114,6 +116,8 @@ if __name__ == '__main__':
     parser.add_argument('-p', '--pattern', default=None,
                         help="Override glob pattern for non-anat scans")
     parser.add_argument('-o', '--output', required=True, help="Output .txt file")
+    parser.add_argument('--min-age-months', type=int, default=None,
+                        help="If set, exclude any session younger than this (months)")
     args = parser.parse_args()
     if len(args.layouts) != len(args.bids_dirs):
         parser.error("--layouts must match number of bids_dirs")

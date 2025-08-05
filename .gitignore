@@ -2,10 +2,12 @@
 to_preprocess_T1w.txt
 derivatives/
 environment.yml
-preprocessing_log.txt
 templates/
-to_preprocess_ping.txt
-
+to_preprocess_*.txt
+preprocessing_log.txt
+preprocessing_log_*.txt
+figures/
+combined-dataset.csv
 
 
 # Byte-compiled / optimized / DLL files
