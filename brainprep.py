@@ -110,8 +110,12 @@ def parse_bids_info(path):
         dataset = "hc-bcp"
     elif "hc-calgary-preschool" in path:
         dataset = "hc-calgary-preschool"
+    elif "hc-new-england" in path:
+        dataset = "hc-new-england"
     elif "daufin" in path:
         dataset = "hc-daufin"
+    elif "pixar" in path:
+        dataset = "hc-pixar"
     elif "ping" in path:
         dataset = "hc-ping"
     elif "mtbi-koala" in path:
@@ -153,7 +157,7 @@ def get_step_paths(input_nifti, preproc_dir, template_name=None):
 
     deriv_root = os.path.join(preproc_dir, "derivatives", template_name, dataset)
 
-    if dataset == "mtbi-koala" or "hc-ping" or "hc-daufin":
+    if dataset in ("mtbi-koala", "hc-ping", "hc-daufin", "hc-pixar"):
         step1_dir = os.path.join(deriv_root, "01_n4",                sub_id, "anat")
         step2_dir = os.path.join(deriv_root, "02_synthstrip",        sub_id, "anat")
         step3_dir = os.path.join(deriv_root, "03_affine_registration", sub_id, "anat")
