@@ -1,5 +1,7 @@
 .vscode/
 to_preprocess_T1w.txt
+all_datasets.csv
+pixar-dataset.csv
 derivatives/
 environment.yml
 rerun_synthseg_failures.py
