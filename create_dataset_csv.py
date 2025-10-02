@@ -107,10 +107,10 @@ def load_participants(root, age_unit="m"):
         if candidate in df.columns:
             age_col = candidate
             break
-
+    print(age_col)
     if age_col:
         df['age'] = df[age_col]
-        
+        print(df['age'])
         if age_unit.lower() == "y":
             df['age'] = df['age'] * 12.0
         # if "m", keep as-is
@@ -167,18 +167,20 @@ def load_sessions(root, age_unit="m"):
             except ValueError:
                 # not numeric; just ensure it has ses- prefix
                 return f"ses-{s}"
-
-        df['session_id'] = df[ses_src].apply(_norm_ses)
+            
+        if 'hc-calgary-preschool' not in root:
+            df['session_id'] = df[ses_src].apply(_norm_ses)
 
     # Age column (unchanged from your version)
     age_col = 'age' if 'age' in df.columns else ('Age' if 'Age' in df.columns else None)
     if age_col:
         df['age'] = pd.to_numeric(df[age_col], errors='coerce')
+        
         if age_unit.lower() == 'y':
             df['age'] = df['age'] * 12.0
     else:
         df['age'] = None
-
+    
     return df
 
 def _normalize_units_list(units_arg, n, parser):
@@ -284,9 +286,9 @@ def main():
                 'segm_path': str(dest / f"{base}_segm.nii.gz"),
                 'latent_path': str(dest / f"{base}_latent.npz"),
             })
-    # print(rows)
-    df = pd.DataFrame(rows)
     
+    df = pd.DataFrame(rows)
+    print(df[df['dataset']=='hc-calgary-preschool']['age'])
     # subject-level strata
     subj_info = df.groupby('subject_id').agg({'sex':'first','age':'mean'}).reset_index()
     subj_info['age_bin'] = pd.qcut(subj_info['age'].fillna(subj_info['age'].median()),
