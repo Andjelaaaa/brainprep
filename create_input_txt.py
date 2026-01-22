@@ -193,7 +193,8 @@ def process_dir(root, glob_suffix, layout, args, allowed_subs, age_lut):
         return True
 
     # --- Excludes ------------------------------------------------------------
-    yaml_file = os.path.join(root, args.exclude_file)
+    yaml_file = os.path.join(root, 'code/', 'qc/', 'raw/', args.exclude_file)
+    print(yaml_file)
     raw = load_excludes(yaml_file) if os.path.exists(yaml_file) else []
     runs = [e for e in raw if '_run-' in e]
     gens = [e for e in raw if '_run-' not in e]

@@ -1,109 +1,110 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
+"""
+brainprep: Preprocessing for pediatric MRI brain data (BIDS derivatives)
 
+This module writes outputs directly into:
+
+    <bids_root>/derivatives/brainprep/sub-*/ses-*/anat/
+
+Pipeline (minimal outputs):
+  1) SynthStrip: skull-stripped image + mask (desc-synthstrip, desc-synthstrip_mask)
+  2) N4: bias correction on skull-stripped (desc-n4)
+  3) Affine registration to template: warped image + warped mask + transform
+  4) SynthSeg: segmentation + QC/vol tables
+  5) Intensity normalization (WhiteStripe) in template space: desc-intnorm
+
+Sphinx notes:
+- Keep code import-safe: do not run pipeline at import.
+- Use `main()` for CLI, and guard with `if __name__ == "__main__":`.
+
+"""
+
+from __future__ import annotations
+
+import argparse
 import os
 import re
-import argparse
-import time
-import numpy as np
-import nibabel as nib
-from multiprocessing import Pool
-from tqdm import tqdm
+import shutil
+import subprocess
 import sys
-from contextlib import redirect_stderr
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
 
+import nibabel as nib
+import numpy as np
 from intensity_normalization.normalize.whitestripe import WhiteStripeNormalize
 from intensity_normalization.typing import Modality
+from multiprocessing import Pool
+from tqdm import tqdm
+from contextlib import redirect_stderr
 
-NPROC = os.cpu_count()
 
-def final_normalize_brain(input_path):
-    """
-    1) WhiteStripe on the registered volume
-    2) Use the registered mask to zero out outside for final "brain"
-    3) Save in step5 as sub-XXX_ses-YYY_normalized.nii.gz, sub-XXX_ses-YYY_brain.nii.gz
-    """
-    sp = outputs_dict[input_path]
-    reg_nii  = sp["registered"]       # template-space volume
-    # if args.template_mask and "nihpd" in template:
-    #     mask_nii = args.template_mask
-    # else:
-    mask_nii = sp["registered_mask"] # template-space mask
-    norm_nii = sp["normalized"]
-    brain_nii= sp["brain"]
+NPROC = os.cpu_count() or 1
 
-    # if os.path.exists(norm_nii) and os.path.exists(brain_nii):
-    #     return
 
-    try:
-        reg_img = nib.load(reg_nii)
-        reg_arr = reg_img.get_fdata()
-
-        # WhiteStripe
-        if not os.path.exists(norm_nii):
-            ws = WhiteStripeNormalize()
-            # No mask => global approach
-            # if args.template_mask and "nihpd" in template:
-            #     mask_arr = nib.load(mask_nii).get_fdata()
-            #     normalized_arr = ws(reg_arr, mask=mask_arr, modality=Modality.T1)
-            #     nib.save(nib.Nifti1Image(normalized_arr, reg_img.affine, reg_img.header), norm_nii)
-            # else:
-            print('\n Saving normalized array...')
-            normalized_arr = ws(reg_arr, mask=None, modality=Modality.T1)
-            nib.save(nib.Nifti1Image(normalized_arr, reg_img.affine, reg_img.header), norm_nii)
-            # Brain extraction using the template-space mask
-            print('\n Doing brain extraction...')
-            mask_arr = nib.load(mask_nii).get_fdata()
-            brain_arr = normalized_arr.copy()
-            brain_arr[mask_arr == 0.] = brain_arr.min()
-            nib.save(nib.Nifti1Image(brain_arr, reg_img.affine, reg_img.header), brain_nii)
-        else:
-            normalized_arr = nib.load(norm_nii).get_fdata()
-
-            # Brain extraction using the template-space mask
-            print('\n Doing brain extraction...')
-            mask_arr = nib.load(mask_nii).get_fdata()
-            brain_arr = normalized_arr.copy()
-            brain_arr[mask_arr == 0.] = brain_arr.min()
-            nib.save(nib.Nifti1Image(brain_arr, reg_img.affine, reg_img.header), brain_nii)
-
-    except Exception as e:
-        print(f"[ERROR] Final normalization failed for {input_path}: {e}")
-
+# -----------------------------------------------------------------------------
+# Logging helper
+# -----------------------------------------------------------------------------
 class TeeLogger:
-    def __init__(self, logfile_path):
+    """Duplicate stdout/stderr to both terminal and a log file."""
+
+    def __init__(self, logfile_path: Path):
         self.terminal = sys.__stdout__
         self.log = open(logfile_path, "w")
         self.closed = False
 
-    def write(self, message):
+    def write(self, message: str) -> None:
         self.terminal.write(message)
         if not self.closed:
             self.log.write(message)
 
-    def flush(self):
+    def flush(self) -> None:
         self.terminal.flush()
         if not self.closed:
             self.log.flush()
 
-    def close(self):
+    def close(self) -> None:
         if not self.closed:
             self.log.close()
             self.closed = True
 
-def get_template_name(template_path):
+
+# -----------------------------------------------------------------------------
+# BIDS parsing + naming
+# -----------------------------------------------------------------------------
+def get_template_name(template_path: str) -> str:
+    """Return template basename without .nii/.nii.gz."""
     base = os.path.basename(template_path)
-    base = re.sub(r'\.nii(\.gz)?$', '', base)  # remove .nii or .nii.gz
+    base = re.sub(r"\.nii(\.gz)?$", "", base)
     return base
 
-################################################################################
-# HELPER: parse sub-XXX/ses-YYY from a path, plus dataset
-################################################################################
 
-def parse_bids_info(path):
+def sanitize_entity(label: str) -> str:
+    """Sanitize a label for use in BIDS entities (alphanumeric only)."""
+    return re.sub(r"[^A-Za-z0-9]+", "", label)
+
+
+def parse_bids_info(path: str) -> Tuple[str, Optional[str], Optional[str], Optional[str]]:
     """
-    Attempt to extract dataset, sub_id, ses_id, run_id from the path.
-    We look for 'hc-bcp', 'hc-calgary-preschool' or fallback to 'unknown_dataset'.
-    Then we parse sub-XXX, ses-YYY from the path or filename.
+    Extract (dataset, sub_id, ses_id, run_id) from a path.
+
+    Parameters
+    ----------
+    path:
+        Path to a BIDS file.
+
+    Returns
+    -------
+    dataset:
+        A heuristic dataset name (based on substrings).
+    sub_id:
+        e.g. "sub-10001" or None
+    ses_id:
+        e.g. "ses-001" or None
+    run_id:
+        e.g. "run-01" or None
     """
     dataset = "unknown_dataset"
     if "hc-bcp" in path:
@@ -122,10 +123,7 @@ def parse_bids_info(path):
         dataset = "mtbi-koala"
 
     m = re.search(r"(sub-[^/]+)", path)
-    if m:
-        sub_id = m.group(1)    # gives "sub-CTL_01"
-    else:
-        sub_id = None
+    sub_id = m.group(1) if m else None
 
     m = re.search(r"(ses-[^/]+)", path)
     ses_id = m.group(1) if m else None
@@ -135,389 +133,493 @@ def parse_bids_info(path):
 
     return dataset, sub_id, ses_id, run_id
 
+def intnorm_worker(bp: BrainprepPaths) -> None:
+        """Pool worker: run WhiteStripe + mask on one BrainprepPaths."""
+        whitestripe_intnorm(bp.warped, bp.warped_mask, bp.intnorm)
+        return True
 
-################################################################################
-# 1) Build a function that returns the BIDS-like path for each pipeline step
-################################################################################
+@dataclass(frozen=True)
+class BrainprepPaths:
+    """All output paths for one input image."""
+    input: Path
+    sub_id: str
+    ses_id: str
+    run_id: Optional[str]
+    space: str
 
-def get_step_paths(input_nifti, preproc_dir, template_name=None):
+    anat_dir: Path
+    work_dir: Path
+
+    synthstrip_img: Path
+    synthstrip_mask: Path
+    n4: Path
+
+    warped: Path
+    warped_mask: Path
+    xfm: Path  # .mat or .h5, chosen based on what ANTs outputs
+
+    dseg: Path
+    qc: Path
+    vol: Path
+
+    intnorm: Path
+
+
+def make_brainprep_paths(input_nifti: str, bids_root: str, template_path: str) -> BrainprepPaths:
     """
-    Return a dictionary of file paths for each step, placed in a BIDS-like structure:
-      preproc_dir/derivatives/<template_name>/<dataset>/(01_n4, 02_synthstrip, 03_affine_registration, 04_synthseg, 05_intensity_normalization)/sub-XXX/ses-YYY/anat/.
+    Create BIDS-derivatives paths under derivatives/brainprep.
 
-    We'll parse dataset, sub_id, ses_id from input_nifti.
+    Notes
+    -----
+    - Keeps run entity if present in input path.
+    - `space` label is derived from template basename (sanitized).
+    - Creates anat_dir and work_dir.
     """
-    template_name = template_name or "default_template"
+    _, sub_id, ses_id, run_id = parse_bids_info(input_nifti)
+    sub_id = sub_id or "sub-UNKNOWN"
+    ses_id = ses_id or "ses-UNKNOWN"
 
-    dataset, sub_id, ses_id, run_id = parse_bids_info(input_nifti)
+    template_base = get_template_name(template_path)
+    # If you prefer a shorter label, you can split on '_' here:
+    # space_raw = template_base.split("_")[0]
+    space = sanitize_entity(template_base)
 
-    # fallback if we can't parse sub/ses
-    if not sub_id: sub_id = "sub-UNKNOWN"
-    if not ses_id: ses_id = "ses-UNKNOWN"
+    deriv_root = Path(bids_root) / "derivatives" / "brainprep"
+    anat_dir = deriv_root / sub_id / ses_id / "anat"
+    work_dir = deriv_root / "work" / sub_id / ses_id
+    anat_dir.mkdir(parents=True, exist_ok=True)
+    work_dir.mkdir(parents=True, exist_ok=True)
 
-    deriv_root = os.path.join(preproc_dir, "derivatives", template_name, dataset)
+    run_part = f"_{run_id}" if run_id else ""
+    base = f"{sub_id}_{ses_id}{run_part}"
 
-    if dataset in ("mtbi-koala", "hc-ping", "hc-daufin", "hc-pixar"):
-        step1_dir = os.path.join(deriv_root, "01_n4",                sub_id, "anat")
-        step2_dir = os.path.join(deriv_root, "02_synthstrip",        sub_id, "anat")
-        step3_dir = os.path.join(deriv_root, "03_affine_registration", sub_id, "anat")
-        step4_dir = os.path.join(deriv_root, "04_synthseg",          sub_id, "anat")
-        step5_dir = os.path.join(deriv_root, "05_intensity_normalization", sub_id, "anat")
+    synthstrip_img = anat_dir / f"{base}_desc-synthstrip_T1w.nii.gz"
+    synthstrip_mask = anat_dir / f"{base}_desc-synthstrip_mask.nii.gz"
+    n4 = anat_dir / f"{base}_desc-n4_T1w.nii.gz"
 
-        for d in [step1_dir, step2_dir, step3_dir, step4_dir, step5_dir]:
-            os.makedirs(d, exist_ok=True)
+    warped = anat_dir / f"{base}_space-{space}_desc-affine_T1w.nii.gz"
+    warped_mask = anat_dir / f"{base}_space-{space}_desc-affine_mask.nii.gz"
 
-        # file naming
-        corrected_nifti     = os.path.join(step1_dir, f"{sub_id}_corrected.nii.gz")
-        skullstrip_nifti    = os.path.join(step2_dir, f"{sub_id}_skullstrip.nii.gz")
-        skullstrip_mask_subj = os.path.join(step2_dir, f"{sub_id}_skullstrip_mask.nii.gz")
-        resampled_skull = os.path.join(step2_dir, f"{sub_id}_resampled_skull.nii.gz")
-        registered_nifti    = os.path.join(step3_dir, f"{sub_id}_turboprep_Warped.nii.gz")
-        registered_mask     = os.path.join(step3_dir, f"{sub_id}_mask.nii.gz")
-        ants_prefix         = os.path.join(step3_dir, f"{sub_id}_turboprep_")
-        synthseg_nifti      = os.path.join(step4_dir, f"{sub_id}_segm.nii.gz")
+    # default expected transform name (we’ll write .mat or .h5 depending on ANTs)
+    xfm = anat_dir / f"{base}_from-T1w_to-{space}_mode-image_xfm.mat"
 
-        # final step 5 outputs
-        normalized_nifti    = os.path.join(step5_dir, f"{sub_id}_normalized.nii.gz")
-        brain_nifti         = os.path.join(step5_dir, f"{sub_id}_brain.nii.gz")
+    dseg = anat_dir / f"{base}_space-{space}_desc-synthseg_dseg.nii.gz"
+    qc = anat_dir / f"{base}_space-{space}_desc-synthseg_qc.tsv"
+    vol = anat_dir / f"{base}_space-{space}_desc-synthseg_vol.tsv"
 
-        return {
-            "dataset":  dataset,
-            "sub_id":   sub_id,
-            "ses_id":   ses_id,
-            "input":    input_nifti,
-            "corrected": corrected_nifti,
-            "skullstrip": skullstrip_nifti,
-            "skullstrip_mask_subj": skullstrip_mask_subj,  # subject-space mask from SynthStrip
-            "resampled_skull": resampled_skull,
-            "registered": registered_nifti,
-            "registered_mask": registered_mask,            # the mask in template space
-            "ants_prefix": ants_prefix,
-            "synthseg":   synthseg_nifti,
-            "normalized": normalized_nifti,
-            "brain":      brain_nifti,
-        }
+    intnorm = anat_dir / f"{base}_space-{space}_desc-intnorm_T1w.nii.gz"
+
+    return BrainprepPaths(
+        input=Path(input_nifti),
+        sub_id=sub_id,
+        ses_id=ses_id,
+        run_id=run_id,
+        space=space,
+        anat_dir=anat_dir,
+        work_dir=work_dir,
+        synthstrip_img=synthstrip_img,
+        synthstrip_mask=synthstrip_mask,
+        n4=n4,
+        warped=warped,
+        warped_mask=warped_mask,
+        xfm=xfm,
+        dseg=dseg,
+        qc=qc,
+        vol=vol,
+        intnorm=intnorm,
+    )
+
+
+# -----------------------------------------------------------------------------
+# Command runners
+# -----------------------------------------------------------------------------
+def run(cmd: List[str], *, quiet: bool = False) -> int:
+    """
+    Run a command. Returns returncode.
+
+    Uses subprocess for safer quoting than os.system.
+    """
+    if not quiet:
+        print("📣", " ".join(cmd))
+    proc = subprocess.run(cmd, stdout=subprocess.DEVNULL if quiet else None,
+                          stderr=subprocess.DEVNULL if quiet else None)
+    return proc.returncode
+
+
+def run_synthstrip(inp: Path, out_img: Path, out_mask: Path, *, quiet: bool = True) -> None:
+    """Run FreeSurfer SynthStrip."""
+    if out_img.exists() and out_mask.exists():
+        return
+    cmd = ["mri_synthstrip", "-i", str(inp), "-o", str(out_img), "-m", str(out_mask)]
+    rc = run(cmd, quiet=quiet)
+    if rc != 0 or not out_img.exists():
+        raise RuntimeError(f"SynthStrip failed: {inp}")
+
+
+def run_n4(inp: Path, out: Path, shrink_factor: int, *, quiet: bool = True) -> None:
+    """Run ANTs N4 bias-field correction."""
+    if out.exists():
+        return
+    cmd = [
+        "N4BiasFieldCorrection", "-d", "3",
+        "-i", str(inp),
+        "-o", str(out),
+        "-s", str(shrink_factor),
+        "-v"
+    ]
+    rc = run(cmd, quiet=quiet)
+    if rc != 0 or not out.exists():
+        raise RuntimeError(f"N4 failed: {inp}")
+
+
+def run_affine_registration(moving: Path, fixed: Path, prefix: Path, threads: int, regtype: str, *, quiet: bool = True) -> Tuple[Path, Path]:
+    """
+    Run antsRegistrationSyNQuick.sh.
+
+    Returns
+    -------
+    warped_img:
+        Path to prefix+'Warped.nii.gz'
+    xfm_path:
+        Path to either '0GenericAffine.mat' or 'Composite.h5'
+    """
+    cmd = [
+        "antsRegistrationSyNQuick.sh",
+        "-d", "3",
+        "-f", str(fixed),
+        "-m", str(moving),
+        "-o", str(prefix),
+        "-n", str(threads),
+        "-t", str(regtype),
+    ]
+    rc = run(cmd, quiet=quiet)
+    if rc != 0:
+        raise RuntimeError("Registration command failed")
+
+    warped = Path(str(prefix) + "Warped.nii.gz")
+    if not warped.exists():
+        raise RuntimeError("Registration did not produce Warped.nii.gz")
+
+    mat = Path(str(prefix) + "0GenericAffine.mat")
+    h5 = Path(str(prefix) + "Composite.h5")
+    if mat.exists():
+        return warped, mat
+    if h5.exists():
+        return warped, h5
+    raise RuntimeError("Registration produced no affine (.mat) or composite (.h5) transform")
+
+
+def apply_transform_mask(mask_subj: Path, ref_img: Path, xfm: Path, out_mask: Path, *, quiet: bool = True) -> None:
+    """Transform subject-space mask into template space using nearest-neighbor."""
+    if out_mask.exists():
+        return
+    cmd = [
+        "antsApplyTransforms", "-d", "3",
+        "-i", str(mask_subj),
+        "-r", str(ref_img),
+        "--interpolation", "NearestNeighbor",
+        "-t", str(xfm),
+        "-o", str(out_mask),
+    ]
+    rc = run(cmd, quiet=quiet)
+    if rc != 0 or not out_mask.exists():
+        raise RuntimeError(f"Failed to transform mask: {mask_subj}")
+
+
+def whitestripe_intnorm(reg_nii: Path, reg_mask: Path, out_nii: Path) -> None:
+    """WhiteStripe normalize a template-space image and apply template-space mask."""
+    if out_nii.exists():
+        return
+
+    reg_img = nib.load(str(reg_nii))
+    reg_arr = reg_img.get_fdata()
+
+    ws = WhiteStripeNormalize()
+    normalized = ws(reg_arr, mask=None, modality=Modality.T1)
+
+    mask_arr = nib.load(str(reg_mask)).get_fdata()
+    brain = normalized.copy()
+    brain[mask_arr == 0.0] = brain.min()
+
+    nib.save(nib.Nifti1Image(brain, reg_img.affine, reg_img.header), str(out_nii))
+
+
+def run_synthseg_batch(pairs: List[Tuple[Path, Path]], qc_paths: List[Path], vol_paths: List[Path],
+                       threads: int, *, quiet: bool = True) -> None:
+    """
+    Run SynthSeg in multi-image mode.
+
+    Parameters
+    ----------
+    pairs:
+        List of (input_image, output_dseg).
+    qc_paths, vol_paths:
+        Per-image qc/vol outputs.
+    """
+    if not pairs:
+        return
+
+    tmp_dir = Path(".")
+
+    inp_list = tmp_dir / "temp-input.txt"
+    out_list = tmp_dir / "temp-output.txt"
+    qc_list = tmp_dir / "temp-qc.txt"
+    vol_list = tmp_dir / "temp-vol.txt"
+
+    with inp_list.open("w") as f_in, out_list.open("w") as f_out:
+        for inp, out in pairs:
+            f_in.write(str(inp) + "\n")
+            f_out.write(str(out) + "\n")
+
+    with qc_list.open("w") as f_qc, vol_list.open("w") as f_vol:
+        for qc, vol in zip(qc_paths, vol_paths):
+            f_qc.write(str(qc) + "\n")
+            f_vol.write(str(vol) + "\n")
+
+    cmd = [
+        "mri_synthseg",
+        "--i", str(inp_list),
+        "--o", str(out_list),
+        "--vol", str(vol_list),
+        "--qc", str(qc_list),
+        "--threads", str(threads),
+        "--cpu",
+    ]
+    rc = run(cmd, quiet=quiet)
+    if rc != 0:
+        raise RuntimeError("SynthSeg failed")
+
+    for p in [inp_list, out_list, qc_list, vol_list]:
+        try:
+            p.unlink()
+        except Exception:
+            pass
+
+
+# -----------------------------------------------------------------------------
+# Pipeline execution
+# -----------------------------------------------------------------------------
+def process_one(paths: BrainprepPaths, template: Path, threads: int, shrinkf: int, regtype: str,
+                skip_n4: bool, template_mask: Optional[Path], keep_work: bool, quiet: bool) -> BrainprepPaths:
+    """
+    Run steps 1-3 for one image: SynthStrip -> N4 -> Registration -> mask transform.
+
+    Returns the same `paths` on success.
+    """
+    # Step 1: SynthStrip
+    run_synthstrip(paths.input, paths.synthstrip_img, paths.synthstrip_mask, quiet=quiet)
+
+    # Step 2: N4 (or skip)
+    if skip_n4:
+        # Treat the skull-stripped image as "n4 output" for downstream steps.
+        if not paths.n4.exists():
+            # Symlink preferred; fallback to copy.
+            try:
+                paths.n4.symlink_to(paths.synthstrip_img)
+            except Exception:
+                shutil.copy2(paths.synthstrip_img, paths.n4)
     else:
-        step1_dir = os.path.join(deriv_root, "01_n4",                sub_id, ses_id, "anat")
-        step2_dir = os.path.join(deriv_root, "02_synthstrip",        sub_id, ses_id, "anat")
-        step3_dir = os.path.join(deriv_root, "03_affine_registration", sub_id, ses_id, "anat")
-        step4_dir = os.path.join(deriv_root, "04_synthseg",          sub_id, ses_id, "anat")
-        step5_dir = os.path.join(deriv_root, "05_intensity_normalization", sub_id, ses_id, "anat")
+        run_n4(paths.synthstrip_img, paths.n4, shrinkf, quiet=quiet)
+
+    # Step 3: Affine registration
+    # Write ANTs intermediate products into work_dir
+    prefix = paths.work_dir / "tmpreg_"
+
+    warped_tmp, xfm_tmp = run_affine_registration(paths.n4, template, prefix, threads, regtype, quiet=quiet)
+
+    # Move warped to final name
+    if not paths.warped.exists():
+        shutil.move(str(warped_tmp), str(paths.warped))
+
+    # Move transform to final name (mat or h5)
+    xfm_to_apply = paths.xfm
+    if xfm_tmp.suffix == ".h5":
+        xfm_to_apply = paths.xfm.with_suffix(".h5")
+
+    if not xfm_to_apply.exists():
+        shutil.move(str(xfm_tmp), str(xfm_to_apply))
+
+    # Mask in template space
+    if template_mask is not None and template_mask.exists():
+        # If user supplies a template-space mask, use it directly
+        if not paths.warped_mask.exists():
+            # symlink or copy
+            try:
+                paths.warped_mask.symlink_to(template_mask)
+            except Exception:
+                shutil.copy2(template_mask, paths.warped_mask)
+    else:
+        apply_transform_mask(paths.synthstrip_mask, paths.warped, xfm_to_apply, paths.warped_mask, quiet=quiet)
+
+    # Cleanup work dir
+    if not keep_work:
+        try:
+            for p in paths.work_dir.glob("tmpreg_*"):
+                if p.is_file():
+                    p.unlink()
+        except Exception:
+            pass
+
+    return paths
 
 
-        for d in [step1_dir, step2_dir, step3_dir, step4_dir, step5_dir]:
-            os.makedirs(d, exist_ok=True)
+def run_pipeline(bids_root: str, inputs: List[str], template: str, threads: int, shrinkf: int, regtype: str,
+                 no_bfc_list: Optional[set], template_mask: Optional[str], keep_work: bool, quiet: bool) -> None:
+    """
+    Full brainprep pipeline: steps 1-5.
+    """
+    template_p = Path(template)
+    tmask_p = Path(template_mask) if template_mask else None
 
-        # file naming
-        corrected_nifti     = os.path.join(step1_dir, f"{sub_id}_{ses_id}_corrected.nii.gz")
-        skullstrip_nifti    = os.path.join(step2_dir, f"{sub_id}_{ses_id}_skullstrip.nii.gz")
-        skullstrip_mask_subj= os.path.join(step2_dir, f"{sub_id}_{ses_id}_skullstrip_mask.nii.gz")
-        resampled_skull = os.path.join(step2_dir, f"{sub_id}_resampled_skull.nii.gz")
-        registered_nifti    = os.path.join(step3_dir, f"{sub_id}_{ses_id}_turboprep_Warped.nii.gz")
-        registered_mask     = os.path.join(step3_dir, f"{sub_id}_{ses_id}_mask.nii.gz")
-        ants_prefix         = os.path.join(step3_dir, f"{sub_id}_{ses_id}_turboprep_")
-        synthseg_nifti      = os.path.join(step4_dir, f"{sub_id}_{ses_id}_segm.nii.gz")
+    # Build per-image paths
+    all_paths: Dict[str, BrainprepPaths] = {}
+    for p in inputs:
+        if not Path(p).exists():
+            print(f"[WARN] missing input: {p}")
+            continue
+        all_paths[p] = make_brainprep_paths(p, bids_root, template)
 
-        # final step 5 outputs
-        normalized_nifti    = os.path.join(step5_dir, f"{sub_id}_{ses_id}_normalized.nii.gz")
-        brain_nifti         = os.path.join(step5_dir, f"{sub_id}_{ses_id}_brain.nii.gz")
+    # Steps 1-3 sequential (keeps external calls simpler to debug)
+    ok_paths: List[BrainprepPaths] = []
+    for inp, bp in tqdm(all_paths.items(), desc="SynthStrip/N4/Reg"):
+        try:
+            skip_n4 = (no_bfc_list is not None and inp in no_bfc_list)
+            ok_paths.append(
+                process_one(
+                    bp, template_p, threads, shrinkf, regtype,
+                    skip_n4=skip_n4,
+                    template_mask=tmask_p,
+                    keep_work=keep_work,
+                    quiet=quiet,
+                )
+            )
+        except Exception as e:
+            print(f"[ERROR] {inp}: {e}")
 
-        return {
-            "dataset":  dataset,
-            "sub_id":   sub_id,
-            "ses_id":   ses_id,
-            "input":    input_nifti,
-            "corrected": corrected_nifti,
-            "skullstrip": skullstrip_nifti,
-            "skullstrip_mask_subj": skullstrip_mask_subj,  # subject-space mask from SynthStrip
-            "resampled_skull": resampled_skull,
-            "registered": registered_nifti,
-            "registered_mask": registered_mask,            # the mask in template space
-            "ants_prefix": ants_prefix,
-            "synthseg":   synthseg_nifti,
-            "normalized": normalized_nifti,
-            "brain":      brain_nifti,
-        }
+    if not ok_paths:
+        print("[!] No successful registrations; stopping.")
+        return
 
+    # Step 5 (your order in practice): SynthSeg
+    seg_pairs: List[Tuple[Path, Path]] = []
+    qc_paths: List[Path] = []
+    vol_paths: List[Path] = []
 
-################################################################################
-# 2) Main
-################################################################################
+    for bp in ok_paths:
+        # choose input for synthseg:
+        # - warped is template-space (consistent)
+        inp_img = bp.warped
+        if bp.dseg.exists():
+            continue
+        seg_pairs.append((inp_img, bp.dseg))
+        qc_paths.append(bp.qc)
+        vol_paths.append(bp.vol)
 
-if __name__ == "__main__":
-     
-    start_time = time.time()
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--inputs', required=True,
-                        help='text file with paths to T1w images (one per line)')
-    parser.add_argument('--template', required=True,
-                        help='template image for antsRegistrationSyNQuick.sh')
-    parser.add_argument('-m', '--modality', default='t1', help='Modality for WhiteStripe')
-    parser.add_argument('-t', '--threads', type=int, default=NPROC, help='threads (default: all cores)')
-    parser.add_argument('-s', '--shrink-factor', type=int, default=4, help='N4 shrink factor (default=4)')
-    parser.add_argument('-r', '--registration-type', type=str, default='a',
-                        help='ANTS reg type {t,r,a} (default=a=affine)')
-    parser.add_argument('--no-bfc', type=str,
-                        help='text file with input paths for which to skip bias field correction')
-    parser.add_argument('--keep', action='store_true',
-                        help='Keep intermediate files')
-    parser.add_argument('--preproc-dir', default='preproces_bcp_cp',
-                        help='Top-level folder for derivatives (default=preproces_bcp_cp)')
-    parser.add_argument('--template-mask', type=str, default=None,
-                    help='Optional template-space brain mask (used instead of transforming subject mask)')
-    parser.add_argument('--dataset', type=str, default=None,
-                    help='Name of dataset to be preprocessed')
+    if seg_pairs:
+        run_synthseg_batch(seg_pairs, qc_paths, vol_paths, threads=threads, quiet=quiet)
 
-
-    args = parser.parse_args()
-    inp_file = args.inputs
-    template = args.template
-
-    threads  = args.threads
-    shrinkf  = args.shrink_factor
-    regtype  = args.registration_type
-    keepint  = args.keep
-    preproc_dir = args.preproc_dir
-    dataset_name = args.dataset
+    # Step 4 (your code runs intnorm in parallel): WhiteStripe + masked brain in template space
+    # parallelize on the original input keys (we pass BrainprepPaths via closure)
     
-    logfile_path = f"preprocessing_log_{dataset_name}.txt"
-    tee = TeeLogger(logfile_path)
 
+    with Pool(processes=threads) as pool:
+        list(tqdm(pool.imap_unordered(intnorm_worker, ok_paths),
+                total=len(ok_paths), desc="IntensityNorm"))
+
+    # Final sanity
+    missing = [bp for bp in ok_paths if not bp.intnorm.exists()]
+    if missing:
+        print(f"[WARN] {len(missing)} intnorm outputs missing")
+    print("✅ Finished all steps!")
+
+
+# -----------------------------------------------------------------------------
+# CLI
+# -----------------------------------------------------------------------------
+def read_inputs_list(txt_path: str) -> List[str]:
+    """Read one path per line, removing enclosing quotes if present."""
+    out: List[str] = []
+    with open(txt_path, "r") as f:
+        for line in f:
+            p = line.strip()
+            if p.startswith('"') and p.endswith('"'):
+                p = p[1:-1]
+            if p:
+                out.append(p)
+    return out
+
+
+def read_no_bfc_list(txt_path: Optional[str]) -> Optional[set]:
+    """Read a set of paths to skip N4."""
+    if not txt_path:
+        return None
+    p = Path(txt_path)
+    if not p.exists():
+        return None
+    with p.open("r") as f:
+        return set(line.strip() for line in f if line.strip())
+
+
+def build_argparser() -> argparse.ArgumentParser:
+    """Create CLI parser."""
+    parser = argparse.ArgumentParser(description="brainprep: pediatric MRI preprocessing (BIDS derivatives)")
+
+    parser.add_argument("--inputs", required=True, help="Text file with paths to T1w images (one per line)")
+    parser.add_argument("--template", required=True, help="Template image for antsRegistrationSyNQuick.sh")
+    parser.add_argument("--bids-root", required=True, help="BIDS dataset root (contains sub-*/ and derivatives/)")
+
+    parser.add_argument("-t", "--threads", type=int, default=NPROC, help="Threads / processes (default: all cores)")
+    parser.add_argument("-s", "--shrink-factor", type=int, default=4, help="N4 shrink factor (default=4)")
+    parser.add_argument("-r", "--registration-type", type=str, default="a", help="ANTS reg type {t,r,a} (default=a)")
+
+    parser.add_argument("--no-bfc", type=str, default=None,
+                        help="Text file with input paths for which to skip N4 (bias correction)")
+    parser.add_argument("--template-mask", type=str, default=None,
+                        help="Optional template-space brain mask (used instead of transforming subject mask)")
+    parser.add_argument("--keep-work", action="store_true", help="Keep intermediate ANTs work files")
+    parser.add_argument("--quiet", action="store_true", help="Suppress tool stdout/stderr")
+
+    parser.add_argument("--dataset", type=str, default="dataset", help="Used for log filename only")
+
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """CLI entrypoint."""
+    args = build_argparser().parse_args(argv)
+
+    inputs = read_inputs_list(args.inputs)
+    no_bfc_set = read_no_bfc_list(args.no_bfc)
+
+    logfile = Path(f"preprocessing_log_{args.dataset}.txt")
+    tee = TeeLogger(logfile)
+
+    start_time = time.time()
     sys.stdout = tee
     with redirect_stderr(tee):
         try:
-            # if args.template_mask and "nihpd" in template:
-            #     print(f"📌 Using non-skull-stripped image for registration and template mask for brain extraction.")
-
-            # read input lines
-            with open(inp_file, 'r') as f:
-                inp_list = []
-                for line in f:
-                    p = line.strip()
-                    # remove leading + trailing quotes if present
-                    if p.startswith('"') and p.endswith('"'):
-                        p = p[1:-1]
-                    inp_list.append(p)
-
-
-            nbc_list = set()
-            if args.no_bfc and os.path.exists(args.no_bfc):
-                with open(args.no_bfc, 'r') as f:
-                    nbc_list = set(l.strip() for l in f.readlines())
-
-            # build a dictionary: { input_path -> step_paths }
-            outputs_dict = {}
-            for input_path in inp_list:
-                if not os.path.exists(input_path):
-                    print(f"Input file does not exist: {input_path}")
-                    continue
-
-                template_name = get_template_name(template)
-                spaths = get_step_paths(input_path, preproc_dir, template_name)
-
-                # skip bias correction if in no-bfc
-                if input_path in nbc_list:
-                    spaths["corrected"] = input_path
-
-                outputs_dict[input_path] = spaths
-
-            ############################################################################
-            # Step 1) N4 Bias Field Correction + Step 2) SynthStrip (with -m) + Step 3) Registration
-            ############################################################################
-            for input_path, paths in tqdm(outputs_dict.items(), desc="Bias/SkullStrip/Reg"):
-                corr_nii   = paths["corrected"]
-                skull_nii  = paths["skullstrip"]
-                resampled_skull = paths["resampled_skull"]
-                subj_mask  = paths["skullstrip_mask_subj"]
-                reg_nii    = paths["registered"]
-                mask_nii   = paths["registered_mask"]  # final mask in template space
-                prefix     = paths["ants_prefix"]
-
-                # skip if registration output already exists
-                # if os.path.exists(reg_nii):
-                #     continue
-
-                # BIAS-FIELD CORRECTION
-                if corr_nii != input_path and not os.path.exists(corr_nii):
-                    cmd = (f'N4BiasFieldCorrection -d 3 -i "{input_path}" '
-                        f'-o "{corr_nii}" '
-                        f'-s {shrinkf} -v > /dev/null')
-                    os.system(cmd)
-                if not os.path.exists(corr_nii):
-                    print(f"[ERROR] N4 failed for {input_path}")
-                    continue
-
-                # SynthStrip with a mask output
-                if not os.path.exists(skull_nii):
-                    os.system(f'mri_synthstrip -i "{corr_nii}" -o {skull_nii} -m {subj_mask}')#--gpu > /dev/null')
-                if not os.path.exists(skull_nii):
-                    print(f"[ERROR] SynthStrip failed for {input_path}")
-                    continue
-
-
-                # Registration to template
-                # if "nihpd" in template:
-                #     # 1) resample moving → template
-                #     os.system(
-                #         f"antsApplyTransforms \
-                #         -d 3 \
-                #         -i {skull_nii} \
-                #         -r {template} \
-                #         -o {resampled_skull} \
-                #         --interpolation Linear"
-                #         )
-                #     reg_cmd = (
-                #             f"antsRegistration "
-                #             f"--collapse-output-transforms 1 "
-                #             f"--dimensionality 3 "
-                #             f"--winsorize-image-intensities [0.005,0.995] "
-                #             f"--initial-moving-transform [{template},{resampled_skull},1] "
-                #             f"--initialize-transforms-per-stage 0 "
-                #             f"--interpolation Linear "
-                #             f"--output [{prefix}, {prefix}Warped.nii.gz] "
-                #             f"--transform Rigid[0.2] "
-                #             f"--metric Mattes[{template},{resampled_skull},1,32,Regular,0.3] "
-                #             f"--convergence [500x250x100,1e-6,10] "
-                #             f"--shrink-factors 6x4x2 "
-                #             f"--smoothing-sigmas 4x2x1vox "
-                #             f"--use-histogram-matching 1 "
-                #             f"--transform Affine[0.1] "
-                #             f"--metric Mattes[{template},{resampled_skull},1,32,Regular,0.3] "
-                #             f"--convergence [500x250x100,1e-6,10] "
-                #             f"--shrink-factors 6x4x2 "
-                #             f"--smoothing-sigmas 4x2x1vox "
-                #             f"--use-histogram-matching 1 "
-                #             f"--write-composite-transform 1"
-                #         )
-
-                # else:
-                #     reg_cmd = (f'antsRegistrationSyNQuick.sh -d 3 '
-                #             f'-f {template} -m {skull_nii} '
-                #             f'-o {prefix} -n {threads} -t {regtype} > /dev/null')
-                reg_cmd = (f'antsRegistrationSyNQuick.sh -d 3 '
-                            f'-f {template} -m {skull_nii} '
-                            f'-o {prefix} -n {threads} -t {regtype} > /dev/null')
-                # print("📣 Full registration command:")
-                # print(reg_cmd)
-                print('\n Doing registration...')
-                os.system(reg_cmd)
-
-                print(prefix)
-                warped_nii = prefix + "Warped.nii.gz"
-                print(warped_nii)
-                if not os.path.exists(warped_nii):
-                    print(f"[ERROR] Registration failed for {input_path}")
-                    continue
-
-                # rename warped => reg_nii
-                os.rename(warped_nii, reg_nii)
-
-                # rename matrix
-                mat_path = prefix + "0GenericAffine.mat"
-                h5_path = prefix + "Composite.h5"  # or sometimes just "composite.h5"
-
-                if os.path.exists(mat_path):
-                    new_mat = os.path.join(os.path.dirname(prefix), "affine_transf.mat")
-                    os.rename(mat_path, new_mat)
-
-                elif os.path.exists(h5_path):
-                    new_mat = os.path.join(os.path.dirname(prefix), "composite_transform.h5")
-                    os.rename(h5_path, new_mat)
-                    print(f"[INFO] Using composite transform: {new_mat}")
-
-                else:
-                    print(f"[WARN] No affine (.mat) or composite (.h5) transform found for {prefix}")
-
-                # remove inverse warped if present
-                iw = prefix + "InverseWarped.nii.gz"
-                if os.path.exists(iw):
-                    os.remove(iw)
-
-                # optionally remove intermediate
-                if not keepint:
-                    # remove skullstrip, etc. as needed
-                    pass
-
-                # Now transform subject-space mask -> template space if no template mask exists
-                # do nearest-neighbor to preserve 0/1
-                # if args.template_mask and "nihpd" in template:
-                #     # Use provided template mask — skip transformation
-                #     paths["registered_mask"] = os.path.abspath(args.template_mask)
-                # else:
-                print('Transforming subject-space mask to template space')
-                # Transform subject-space mask to template space
-                mat_app = (f"antsApplyTransforms -d 3 "
-                        f"-i {subj_mask} "
-                        f"-r {reg_nii} "
-                        f"--interpolation NearestNeighbor "
-                        f"-t {new_mat} "
-                        f"-o {mask_nii}")
-                os.system(mat_app)
-                if not os.path.exists(mask_nii):
-                    print(f"[ERROR] failed to transform mask for {input_path}")
-
-
-            ############################################################################
-            # Step 4) WhiteStripe Normalization + Brain using Registered Mask
-            #         (Use a pool to process in parallel)
-            ############################################################################
-
-            # gather all input_paths that remain
-            final_list = list(outputs_dict.keys())
-
-            with Pool(processes=threads) as pool:
-                for _ in tqdm(pool.imap_unordered(final_normalize_brain, final_list), total=len(final_list)):
-                    pass
-
-            ############################################################################
-            # Step 5) Optional: SynthSeg on Skull-Stripped (if NIH-PD) or Registered
-            ############################################################################
-
-            reg_seg_pairs = []
-            for inp, sp in outputs_dict.items():
-                # if os.path.exists(sp["synthseg"]):
-                #     continue  # Skip if already done
-
-                # Use skull-stripped input if NIH-PD template and brain.nii.gz exists
-                # if args.template_mask and "nihpd" in template and os.path.exists(sp["brain"]):
-                #     input_img = sp["brain"]
-                # else:
-                input_img = sp["registered"]
-
-                reg_seg_pairs.append((input_img, sp["synthseg"]))
-
-            if len(reg_seg_pairs) > 0:
-                with open("temp-input.txt", "w") as f_in, open("temp-output.txt", "w") as f_out:
-                    for r, s in reg_seg_pairs:
-                        f_in.write(r + "\n")
-                        f_out.write(s + "\n")
-                with open("temp-qc.txt", "w") as f_qc, open("temp-vol.txt", "w") as f_vol:
-                    for r, s in reg_seg_pairs:
-                        vol_csv = s.replace("_segm.nii.gz", "_vol.csv")
-                        f_vol.write(vol_csv + "\n")
-                        qc_csv = s.replace("_segm.nii.gz", "_qc.csv")
-                        f_qc.write(qc_csv + "\n")
-
-                # Run SynthSeg (multiple images mode)
-                os.system(f'mri_synthseg --i temp-input.txt --o temp-output.txt --vol temp-vol.txt --qc temp-qc.txt --threads {threads} --cpu')
-                os.remove("temp-input.txt")
-                os.remove("temp-output.txt")
-                os.remove("temp-vol.txt")
-                os.remove("temp-qc.txt")
-
-            # Check success
-            for inp, sp in list(outputs_dict.items()):
-                if not os.path.exists(sp["synthseg"]):
-                    print(f"[WARN] SynthSeg failed for {inp}")
-                    del outputs_dict[inp]
-
-
-            print("✅ Finished all steps!")
-
+            run_pipeline(
+                bids_root=args.bids_root,
+                inputs=inputs,
+                template=args.template,
+                threads=args.threads,
+                shrinkf=args.shrink_factor,
+                regtype=args.registration_type,
+                no_bfc_list=no_bfc_set,
+                template_mask=args.template_mask,
+                keep_work=args.keep_work,
+                quiet=args.quiet,
+            )
             end_time = time.time()
-            elapsed_minutes = (end_time - start_time) / 60
+            elapsed_minutes = (end_time - start_time) / 60.0
             print(f"🕒 Total time: {elapsed_minutes:.2f} minutes")
-
         finally:
             sys.stdout = sys.__stdout__
             tee.close()
+
+    
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

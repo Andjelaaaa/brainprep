@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """
+create_dataset_csv
+==================
 This script aggregates preprocessed BIDS image lists across one or more datasets
 into a single CSV suitable for downstream modeling. For each dataset it:
 
@@ -52,288 +54,489 @@ Authors:
     Andjela Dimitrijevic
 """  
 
-import pandas as pd
+from __future__ import annotations
+
 import argparse
-import random
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+import pandas as pd
 from sklearn.model_selection import StratifiedKFold
 
 
-def load_participants(root, age_unit="m"):
+# -----------------------------------------------------------------------------
+# Utilities
+# -----------------------------------------------------------------------------
+def _strip_quotes(s: str) -> str:
+    """Strip whitespace and enclosing single/double quotes."""
+    s = s.strip()
+    if len(s) >= 2 and ((s[0] == s[-1]) and s[0] in ("'", '"')):
+        return s[1:-1]
+    return s
+
+
+def read_paths_list(txt_path: Path) -> List[str]:
     """
-    Load participants.tsv and return dicts for sex and age.
-    
+    Read one path per line from a text file.
+
+    Supports lines optionally wrapped in quotes (common when generating lists for tools).
+
     Parameters
     ----------
-    root : str or Path
-        Root directory containing participants.tsv
-    age_unit : str, optional
-        Unit of age values: 
-          - "m" = months (keep as is)
-          - "y" = years (convert to months)
+    txt_path:
+        Path to the text file.
+
+    Returns
+    -------
+    list[str]
+        Cleaned paths.
     """
-    print(f'Root is {root}')
-    pfile = Path(root) / 'participants.tsv'
-    df = pd.read_csv(pfile, sep='\t')
+    out: List[str] = []
+    with txt_path.open("r") as f:
+        for line in f:
+            p = _strip_quotes(line)
+            if p:
+                out.append(p)
+    return out
+
+
+def detect_sex_column(df: pd.DataFrame) -> Optional[str]:
+    """Return the first matching sex/gender column name, if present."""
+    for candidate in ("sex", "Sex", "gender", "Gender"):
+        if candidate in df.columns:
+            return candidate
+    return None
+
+
+def detect_age_column(df: pd.DataFrame) -> Optional[str]:
+    """Return the first matching age column name, if present."""
+    for candidate in ("age", "Age"):
+        if candidate in df.columns:
+            return candidate
+    return None
+
+
+def normalize_age_to_months(age_series: pd.Series, age_unit: str) -> pd.Series:
+    """
+    Convert age to months if needed.
+
+    Parameters
+    ----------
+    age_series:
+        Numeric age series.
+    age_unit:
+        ``"m"`` for months or ``"y"`` for years.
+
+    Returns
+    -------
+    pd.Series
+        Age in months.
+    """
+    age = pd.to_numeric(age_series, errors="coerce")
+    if age_unit.lower() == "y":
+        return age * 12.0
+    return age
+
+
+# -----------------------------------------------------------------------------
+# Metadata loading
+# -----------------------------------------------------------------------------
+def load_participants(root: Path, age_unit: str = "m") -> Tuple[Dict[str, int], Dict[str, float]]:
+    """
+    Load ``participants.tsv`` and return lookup dicts for sex and age.
+
+    Sex is normalized to:
+      - 0 = male
+      - 1 = female
+      - -1 = missing/unknown
+
+    Age is returned in **months**.
+
+    Parameters
+    ----------
+    root:
+        BIDS dataset root containing ``participants.tsv``.
+    age_unit:
+        ``"m"`` = months, ``"y"`` = years (converted to months).
+
+    Returns
+    -------
+    sex_map:
+        dict mapping ``participant_id`` -> {0,1,-1}
+    age_map:
+        dict mapping ``participant_id`` -> age_months
+    """
+    pfile = root / "participants.tsv"
+    if not pfile.exists():
+        raise FileNotFoundError(f"Missing participants.tsv: {pfile}")
+
+    df = pd.read_csv(pfile, sep="\t")
     df.columns = df.columns.str.strip()
 
-    # ---- Normalize sex/gender column
-    sex_col = None
-    for candidate in ['sex', 'Sex', 'gender', 'Gender']:
-        if candidate in df.columns:
-            sex_col = candidate
-            break
-    
-    if sex_col:
-        col = df[sex_col]
+    # ---- Sex
+    sex_col = detect_sex_column(df)
+    if sex_col is None:
+        df["sex_norm"] = -1
+    else:
+        col = df[sex_col].astype(str).str.strip()
 
-        # 1) Try to keep existing 0/1 (works for numeric and "0"/"1")
-        sex_num = pd.to_numeric(col, errors='coerce').where(lambda x: x.isin([0, 1]))
+        # numeric 0/1 if present
+        sex_num = pd.to_numeric(col, errors="coerce")
+        sex_num = sex_num.where(sex_num.isin([0, 1]))
 
-        # 2) Map remaining values (M/F, case-insensitive; add variants if you like)
-        sex_map = col.astype(str).str.strip().str.lower().map({
-            'm': 0, 'male': 0,
-            'f': 1, 'female': 1
+        # string map
+        sex_map_str = col.str.lower().map({
+            "m": 0, "male": 0,
+            "f": 1, "female": 1
         })
 
-        # 3) Combine (prefer numeric where present)
-        df['sex'] = sex_num.fillna(sex_map).astype('Int64')  # keeps NA if unknown
+        # combine and fill missing as -1
+        sex_combined = sex_num.fillna(sex_map_str).fillna(-1).astype(int)
+        df["sex_norm"] = sex_combined
+
+    # ---- Age
+    age_col = detect_age_column(df)
+    if age_col is None:
+        df["age_months"] = pd.NA
     else:
-        df['sex'] = None
+        df["age_months"] = normalize_age_to_months(df[age_col], age_unit=age_unit)
 
-    # ---- Normalize age column
-    age_col = None
-    for candidate in ['age', 'Age']:
-        if candidate in df.columns:
-            age_col = candidate
-            break
-    print(age_col)
-    if age_col:
-        df['age'] = df[age_col]
-        print(df['age'])
-        if age_unit.lower() == "y":
-            df['age'] = df['age'] * 12.0
-        # if "m", keep as-is
-    else:
-        df['age'] = None
+    # ---- Dicts keyed by participant_id
+    if "participant_id" not in df.columns:
+        raise ValueError("participants.tsv must contain a 'participant_id' column")
 
-    # ---- Build dicts
-    sex_map = df.set_index('participant_id')['sex'].to_dict()
-    age_map = df.set_index('participant_id')['age'].to_dict()
-    
-
+    sex_map = df.set_index("participant_id")["sex_norm"].to_dict()
+    age_map = df.set_index("participant_id")["age_months"].to_dict()
     return sex_map, age_map
 
 
-# def load_sessions(root, age_unit="m"):
-#     sfile = Path(root) / 'sessions.tsv'
-#     df = pd.read_csv(sfile, sep='\t')
-#     df.columns = df.columns.str.strip()
-#     age_col = 'age' if 'age' in df.columns else ('Age' if 'Age' in df.columns else None)
-#     if age_col:
-#         df['age'] = pd.to_numeric(df[age_col], errors='coerce')
-        
-#         if age_unit == 'y':
-#             df['age'] = df['age'] * 12.0
-#     else:
-#         df['age'] = None
-#     return df
+def load_sessions(root: Path, age_unit: str = "m") -> pd.DataFrame:
+    """
+    Load ``sessions.tsv`` and normalize session_id + age.
 
-def load_sessions(root, age_unit="m"):
-    from pathlib import Path
-    import pandas as pd
+    For longitudinal datasets, age is looked up using
+    ``(participant_id, session_id)``.
 
-    sfile = Path(root) / 'sessions.tsv'
-    df = pd.read_csv(sfile, sep='\t')
+    Parameters
+    ----------
+    root:
+        BIDS dataset root containing ``sessions.tsv``.
+    age_unit:
+        ``"m"`` months, ``"y"`` years (converted to months).
+
+    Returns
+    -------
+    pd.DataFrame
+        Sessions dataframe with columns:
+        ``participant_id``, ``session_id``, ``age_months`` (if age column exists).
+    """
+    sfile = root / "sessions.tsv"
+    if not sfile.exists():
+        raise FileNotFoundError(f"Missing sessions.tsv: {sfile}")
+
+    df = pd.read_csv(sfile, sep="\t")
     df.columns = df.columns.str.strip()
 
-    # Pick the source session column
-    ses_src = 'session_id' if 'session_id' in df.columns else (
-        'session' if 'session' in df.columns else None
-    )
+    if "participant_id" not in df.columns:
+        raise ValueError("sessions.tsv must contain a 'participant_id' column")
 
-    if ses_src is not None:
-        def _norm_ses(v):
-            if pd.isna(v):
-                return pd.NA
-            s = str(v).strip()
-            # strip leading "ses-" if present
-            if s.lower().startswith('ses-'):
-                s = s[4:]
-            # numeric? -> ses-XX
-            try:
-                n = int(float(s))
-                return f"ses-{n:02d}"
-            except ValueError:
-                # not numeric; just ensure it has ses- prefix
-                return f"ses-{s}"
-            
-        if 'hc-calgary-preschool' not in root:
-            df['session_id'] = df[ses_src].apply(_norm_ses)
+    # Choose session source column
+    ses_src = "session_id" if "session_id" in df.columns else ("session" if "session" in df.columns else None)
+    if ses_src is None:
+        raise ValueError("sessions.tsv must contain 'session_id' or 'session' column")
 
-    # Age column (unchanged from your version)
-    age_col = 'age' if 'age' in df.columns else ('Age' if 'Age' in df.columns else None)
-    if age_col:
-        df['age'] = pd.to_numeric(df[age_col], errors='coerce')
-        
-        if age_unit.lower() == 'y':
-            df['age'] = df['age'] * 12.0
+    def _norm_ses(v: object) -> str:
+        if pd.isna(v):
+            return ""
+        s = str(v).strip()
+        if s.lower().startswith("ses-"):
+            s = s[4:]
+        # numeric? -> ses-XX
+        try:
+            n = int(float(s))
+            return f"ses-{n:02d}"
+        except ValueError:
+            return f"ses-{s}"
+
+    df["session_id"] = df[ses_src].apply(_norm_ses)
+
+    age_col = detect_age_column(df)
+    if age_col is None:
+        df["age_months"] = pd.NA
     else:
-        df['age'] = None
-    
+        df["age_months"] = normalize_age_to_months(df[age_col], age_unit=age_unit)
+
     return df
 
-def _normalize_units_list(units_arg, n, parser):
-    # default: assume months everywhere if not provided
+
+# -----------------------------------------------------------------------------
+# CSV building
+# -----------------------------------------------------------------------------
+@dataclass(frozen=True)
+class DatasetSpec:
+    """One dataset configuration."""
+    root: Path
+    layout: str                # "long" or "cross"
+    input_list: Path
+    age_unit: str              # "m" or "y"
+
+
+def extract_sub_ses(path_str: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Extract BIDS subject/session from a path by scanning path parts.
+
+    Returns
+    -------
+    (sub_id, ses_id)
+        Each can be None if not found.
+    """
+    parts = Path(path_str).parts
+    sid = next((x for x in parts if x.startswith("sub-")), None)
+    ses = next((x for x in parts if x.startswith("ses-")), None)
+    return sid, ses
+
+
+def build_rows(
+    spec: DatasetSpec,
+    sex_map: Dict[str, int],
+    age_map: Dict[str, float],
+    sessions_df: Optional[pd.DataFrame],
+    dest: Path,
+) -> List[Dict[str, object]]:
+    """
+    Build per-image rows for one dataset.
+
+    Parameters
+    ----------
+    spec:
+        Dataset configuration.
+    sex_map, age_map:
+        Lookups from participants.tsv.
+    sessions_df:
+        Sessions dataframe for long layout, else None.
+    dest:
+        Base destination folder for brain/segm/latent.
+
+    Returns
+    -------
+    list[dict]
+        Rows for the combined CSV.
+    """
+    ds_name = spec.root.name
+    paths = read_paths_list(spec.input_list)
+
+    rows: List[Dict[str, object]] = []
+
+    for p in paths:
+        sid, ses = extract_sub_ses(p)
+        if not sid:
+            continue
+
+        if spec.layout == "cross":
+            image_uid = sid
+            age = age_map.get(sid, pd.NA)
+            base = sid
+        else:
+            image_uid = ses or sid
+            base = f"{sid}_{ses}" if ses else sid
+
+            age = pd.NA
+            if sessions_df is not None and ses:
+                r = sessions_df[(sessions_df["participant_id"] == sid) & (sessions_df["session_id"] == ses)]
+                if not r.empty:
+                    age = r.iloc[0].get("age_months", pd.NA)
+
+        sex = sex_map.get(sid, -1)
+
+        rows.append({
+            "dataset": ds_name,
+            "subject_id": sid,
+            "image_uid": image_uid,
+            "sex": sex,
+            "age": age,  # months (raw, will be copied to age_bef_norm later)
+            "image_path": str(dest / f"{base}_brain.nii.gz"),
+            "segm_path": str(dest / f"{base}_segm.nii.gz"),
+            "latent_path": str(dest / f"{base}_latent.npz"),
+        })
+
+    return rows
+
+
+def assign_stratified_folds(df: pd.DataFrame, folds: int, seed: int) -> pd.Series:
+    """
+    Assign stratified folds at the *subject level* using sex + age bins.
+
+    Parameters
+    ----------
+    df:
+        Dataframe with columns ``subject_id``, ``sex``, ``age``.
+    folds:
+        Number of folds.
+    seed:
+        Random seed.
+
+    Returns
+    -------
+    pd.Series
+        Series mapping subject_id -> split (1..folds).
+    """
+    subj = (
+        df.groupby("subject_id")
+          .agg(sex=("sex", "first"), age=("age", "mean"))
+          .reset_index()
+    )
+
+    # age bins; fill missing with median to avoid dropping subjects
+    age_filled = subj["age"].fillna(subj["age"].median())
+    n_bins = min(folds, 5)
+    subj["age_bin"] = pd.qcut(age_filled, q=n_bins, duplicates="drop").astype(str)
+
+    subj["strata"] = subj["sex"].astype(str) + "_" + subj["age_bin"]
+
+    skf = StratifiedKFold(n_splits=folds, shuffle=True, random_state=seed)
+
+    fold_assign: Dict[str, int] = {}
+    for fold, (_, test_idx) in enumerate(skf.split(subj, subj["strata"]), start=1):
+        for idx in test_idx:
+            fold_assign[subj.iloc[idx]["subject_id"]] = fold
+
+    return df["subject_id"].map(fold_assign)
+
+
+def normalize_age_inplace(df: pd.DataFrame) -> None:
+    """
+    Copy raw age into ``age_bef_norm`` and min-max normalize age into ``age``.
+
+    Notes
+    -----
+    Operates in-place.
+    """
+    df["age_bef_norm"] = df["age"]
+
+    ages = pd.to_numeric(df["age_bef_norm"], errors="coerce")
+    min_a, max_a = ages.min(), ages.max()
+    if pd.isna(min_a) or pd.isna(max_a) or max_a == min_a:
+        # avoid divide-by-zero
+        df["age"] = pd.NA
+        return
+
+    df["age"] = ((ages - min_a) / (max_a - min_a)).round(4)
+
+
+# -----------------------------------------------------------------------------
+# CLI
+# -----------------------------------------------------------------------------
+def build_argparser() -> argparse.ArgumentParser:
+    """Create CLI parser."""
+    p = argparse.ArgumentParser(
+        description="Create combined dataset CSV with stratified folds and normalized age."
+    )
+    p.add_argument("--bids-roots", nargs="+", required=True, help="List of BIDS root directories.")
+    p.add_argument("--layouts", nargs="+", choices=["long", "cross"], required=True,
+                   help="Layout per root: long or cross.")
+    p.add_argument("--input-lists", nargs="+", required=True,
+                   help="List of preprocess_<dataset>.txt files, one per BIDS root.")
+    p.add_argument("--age-units", nargs="+", default=None,
+                   help='Age units per dataset ("y" years or "m" months). '
+                        "If one value is given, it is applied to all datasets.")
+    p.add_argument("--dest-path-for-images", required=True,
+                   help="Base destination path for brain/segm/latent files.")
+    p.add_argument("--out-csv", default="dataset.csv", help="Output CSV file path.")
+    p.add_argument("--folds", type=int, default=5, help="Number of stratified folds.")
+    p.add_argument("--seed", type=int, default=42, help="Random seed.")
+    return p
+
+
+def _normalize_units_list(units_arg: Optional[Sequence[str]], n: int, parser: argparse.ArgumentParser) -> List[str]:
+    """Normalize --age-units to length n (broadcast if a single unit is provided)."""
     if units_arg is None:
-        return ['m'] * n
+        return ["m"] * n
     units = [u.lower() for u in units_arg]
-    # if a single value is provided, broadcast to all roots
     if len(units) == 1:
-        return units * n
+        units = units * n
     if len(units) != n:
-        parser.error('Number of --age-units must match number of --bids-roots (or provide a single value to use for all).')
-    # validate
-    bad = [u for u in units if u not in ('m', 'y')]
+        parser.error("Number of --age-units must match --bids-roots (or provide a single value).")
+    bad = [u for u in units if u not in ("m", "y")]
     if bad:
         parser.error(f'Invalid age unit(s): {bad}. Use "m" or "y".')
     return units
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description='Create combined dataset CSV with stratified folds and normalized age')
-    parser.add_argument('--bids-roots', nargs='+', required=True,
-                        help='List of BIDS root directories')
-    parser.add_argument('--layouts', nargs='+', choices=['long','cross'], required=True,
-                        help='Layout per root: long or cross')
-    parser.add_argument('--input-lists', nargs='+', required=True,
-                        help='List of preprocess_<dataset>.txt files, one per BIDS root')
-    parser.add_argument('--age-units', nargs='+', default=None,
-                    help='Age units per dataset, matching --bids-roots order. '
-                         'Use "y" for years or "m" for months. '
-                         'If one value is given, it is applied to all datasets.')
-    parser.add_argument('--dest-path-for-images', required=True,
-                        help='Base destination path for brain/segm/latent files')
-    parser.add_argument('--out-csv', default='dataset.csv',
-                        help='Output CSV file path')
-    parser.add_argument('--folds', type=int, default=5,
-                        help='Number of stratified folds')
-    parser.add_argument('--seed', type=int, default=42,
-                        help='Random seed')
-    args = parser.parse_args()
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """
+    CLI entrypoint.
+
+    Returns
+    -------
+    int
+        Exit code (0 on success).
+    """
+    parser = build_argparser()
+    args = parser.parse_args(argv)
 
     n = len(args.bids_roots)
     if not (len(args.layouts) == n == len(args.input_lists)):
-        parser.error('Number of --bids-roots, --layouts, and --input-lists must match')
+        parser.error("Number of --bids-roots, --layouts, and --input-lists must match.")
 
-    if args.age_units is None:
-        args.age_units = ['m'] * len(args.bids_roots)
-    elif len(args.age_units) != len(args.bids_roots):
-        parser.error('Number of --age-units must match --bids-roots')
+    age_units = _normalize_units_list(args.age_units, n, parser)
 
-    age_units_per_root = _normalize_units_list(args.age_units, n, parser)
+    # Build dataset specs
+    specs: List[DatasetSpec] = []
+    for root, layout, inplist, unit in zip(args.bids_roots, args.layouts, args.input_lists, age_units):
+        specs.append(DatasetSpec(
+            root=Path(root).resolve(),
+            layout=layout,
+            input_list=Path(inplist).resolve(),
+            age_unit=unit,
+        ))
 
-    # load metadata per dataset
-    sex_maps = {}
-    age_maps = {}
-    session_dfs = {}
+    dest = Path(args.dest_path_for_images).resolve()
 
-    for root, layout, unit in zip(args.bids_roots, args.layouts, age_units_per_root):
-        ds = Path(root).name
-        sex_map, age_map = load_participants(root, age_unit=unit)
-        sex_maps[ds] = sex_map
-        age_maps[ds] = age_map
-        if layout == 'long':
-            session_dfs[ds] = load_sessions(root, age_unit=unit)
+    # Load metadata + build rows
+    all_rows: List[Dict[str, object]] = []
+    layouts_by_ds: Dict[str, str] = {}
 
-    # gather records
-    rows = []
-    for root, layout, input_list in zip(args.bids_roots, args.layouts, args.input_lists):
-        ds = Path(root).name
-        sex_map = sex_maps[ds]
-        age_map = age_maps[ds]
-        sess_df = session_dfs.get(ds)
-        with open(input_list) as f:
-            paths = [p.strip() for p in f if p.strip()]
-        for p in paths:
-            parts = Path(p).parts
-            sid = next((x for x in parts if x.startswith('sub-')), None)
-            ses = next((x for x in parts if x.startswith('ses-')), None)
-            if not sid:
-                continue
-            image_uid = sid if layout == 'cross' else ses or sid
-            # age
-            if layout == 'cross':
-                age = age_map.get(sid)
-            else:
-                age = None
-                if sess_df is not None and ses:
-                    row = sess_df[(sess_df['participant_id']==sid)&(sess_df['session_id']==ses)]
-                    if not row.empty:
-                        age = float(row.iloc[0]['age'])
-            sex = sex_map.get(sid, -1)
-            # file base for outputs
-            base = sid if layout == 'cross' else f"{sid}_{ses}"
-            dest = Path(args.dest_path_for_images)
-            rows.append({
-                'dataset': ds,
-                'subject_id': sid,
-                'image_uid': image_uid,
-                'sex': sex,
-                'age': age,
-                'image_path': str(dest / f"{base}_brain.nii.gz"),
-                'segm_path': str(dest / f"{base}_segm.nii.gz"),
-                'latent_path': str(dest / f"{base}_latent.npz"),
-            })
-    
-    df = pd.DataFrame(rows)
-    print(df[df['dataset']=='hc-calgary-preschool']['age'])
-    # subject-level strata
-    subj_info = df.groupby('subject_id').agg({'sex':'first','age':'mean'}).reset_index()
-    subj_info['age_bin'] = pd.qcut(subj_info['age'].fillna(subj_info['age'].median()),
-                                    q=min(args.folds,5), duplicates='drop').astype(str)
-    subj_info['strata'] = subj_info['sex'].astype(str) + '_' + subj_info['age_bin']
-    skf = StratifiedKFold(n_splits=args.folds, shuffle=True, random_state=args.seed)
-    fold_assign = {}
-    for fold, (_, test_idx) in enumerate(skf.split(subj_info, subj_info['strata']), 1):
-        for idx in test_idx:
-            fold_assign[subj_info.iloc[idx]['subject_id']] = fold
-    df['split'] = df['subject_id'].map(fold_assign)
+    for spec in specs:
+        ds = spec.root.name
+        layouts_by_ds[ds] = spec.layout
 
-    # --- counts per split ---
-    # subjects per split (unique subjects)
-    subj_counts = (
-        subj_info
-        .assign(split=subj_info['subject_id'].map(fold_assign))
-        .groupby('split')['subject_id'].nunique()
-        .sort_index()
-    )
+        sex_map, age_map = load_participants(spec.root, age_unit=spec.age_unit)
+        sess_df = load_sessions(spec.root, age_unit=spec.age_unit) if spec.layout == "long" else None
 
+        all_rows.extend(build_rows(spec, sex_map, age_map, sess_df, dest))
+
+    df = pd.DataFrame(all_rows)
+    if df.empty:
+        raise SystemExit("No rows produced (check inputs and paths).")
+
+    # Fold assignment at subject level
+    df["split"] = assign_stratified_folds(df, folds=args.folds, seed=args.seed)
+
+    # Print fold counts
+    subj_counts = df.groupby("split")["subject_id"].nunique().sort_index()
     print("\nSubjects per split:")
-    for sp, n in subj_counts.items():
-        print(f"  split {int(sp)}: {int(n)} subjects")
+    for sp, cnt in subj_counts.items():
+        print(f"  split {int(sp)}: {int(cnt)} subjects")
 
-    # scans per split (only if long layout: multiple rows per subject)
-    if getattr(args, "layout", None) == "long":
-        scan_counts = df.groupby('split').size().sort_index()
-        print("\nScans per split (long layout):")
-        for sp, n in scan_counts.items():
-            print(f"  split {int(sp)}: {int(n)} scans")
+    # Scan counts for datasets that are long
+    any_long = any(layout == "long" for layout in layouts_by_ds.values())
+    if any_long:
+        scan_counts = df.groupby("split").size().sort_index()
+        print("\nScans per split (includes longitudinal datasets):")
+        for sp, cnt in scan_counts.items():
+            print(f"  split {int(sp)}: {int(cnt)} scans")
 
-    # rename original age to age_bef_norm
-    df['age_bef_norm'] = df['age']
-    # normalize age and overwrite 'age'
-    ages = df['age_bef_norm']
-    min_a, max_a = ages.min(), ages.max()
-    df['age'] = ((ages - min_a) / (max_a - min_a)).round(4)
-    print(f'min age: {min_a}')
-    print(f'max age: {max_a}')
-    # drop any leftover age_norm column
-    df.drop(columns=['age_norm'], errors='ignore', inplace=True)
+    # Normalize age
+    normalize_age_inplace(df)
+    ages = pd.to_numeric(df["age_bef_norm"], errors="coerce")
+    print(f"\nmin age (months): {ages.min()}")
+    print(f"max age (months): {ages.max()}")
 
     df.to_csv(args.out_csv, index=False)
-    print(f"Wrote {len(df)} records to {args.out_csv}")
+    print(f"\nWrote {len(df)} records to {args.out_csv}")
+    return 0
 
-if __name__ == '__main__':
-    main()
+
+if __name__ == "__main__":
+    raise SystemExit(main())
