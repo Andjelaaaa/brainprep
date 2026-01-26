@@ -5,7 +5,7 @@ to_preprocess_T1w.txt
 all_datasets.csv
 pixar-dataset.csv
 derivatives/
-environment.yml
+dataset.csv
 rerun_synthseg_failures.py
 templates/
 to_preprocess_*.txt

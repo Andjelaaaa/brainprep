@@ -1,11 +1,32 @@
 # brainprep 🧠
 Preprocessing for pediatric (1-7 yo) MRI brain data
 
-This preprocessing is BIDs compliant and writes the derivatives directly in your BIDs datasets derivative/brainprep folder. This can be used with whatever BIDS compliant file which has exclude.yaml file as indicated in the steps below. It involves 3 steps after QC of raw MRI images + works for both cross-sectional and longitudinal datasets.
+This preprocessing follows the BIDS standard and writes all outputs directly into your dataset’s `derivatives/brainprep/` folder. It works with any BIDS-compliant dataset that provides an `exclude.yaml` file (as described below). After raw-image QC, the workflow runs in three steps and supports both cross-sectional and longitudinal datasets.
+
 
 ---
 
-### 1) Create the input list (`create_input_txt.py`)
+## Install `brainprep` (using `environment.yml`)
+
+1) **Create the conda environment**
+```bash
+conda env create -f environment.yml
+```
+
+2. **Activate it**
+
+```bash
+conda activate brainprep
+```
+
+3. **Run a script**
+
+```bash
+python brainprep.py --help
+```
+
+
+## 1) Create the input list (`create_input_txt.py`)
 
 This step scans one or more **BIDS root** directories and writes a text file containing the **absolute paths** to images that should be preprocessed by `brainprep.py`.
 
@@ -177,7 +198,7 @@ python create_input_txt.py /path/to/bids \
 
 ---
 
-### 2) Run the preprocessing (`brainprep.py`)
+## 2) Run the preprocessing (`brainprep.py`)
 
 This step reads the image list produced by `create_input_txt.py` and writes BIDS-derivatives outputs directly into the dataset:
 
