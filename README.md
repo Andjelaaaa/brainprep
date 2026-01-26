@@ -310,6 +310,127 @@ python brainprep.py \
 
 ---
 
-3) Running create_dataset_csv.py which gives a csv with paths of images where it will be trained (on compute canada in my case including fields such as dataset,subject_id,image_uid,sex,age,image_path,segm_path,latent_path,split,age_bef_norm), also add the arguments to run this script with command line
+## 3) Build the training CSV (`create_dataset_csv.py`)
 
-Afterwards it is ready for training
+This step aggregates one or more preprocessed datasets into a **single CSV** used for downstream training (e.g., on Compute Canada). It uses:
+
+* the per-dataset input lists produced earlier (e.g., `preprocess_<dataset>.txt`)
+* each dataset’s `participants.tsv` (sex + age for cross-sectional)
+* each dataset’s `sessions.tsv` (session-specific age for longitudinal datasets)
+
+It outputs a CSV with (at minimum) these columns:
+
+* `dataset`, `subject_id`, `image_uid`
+* `sex` (0 = male, 1 = female, -1 = missing/unknown)
+* `age_bef_norm` (raw age in months, rounded to 3 decimals)
+* `age` (min–max normalized to [0,1])
+* `image_path`, `segm_path`, `latent_path`
+* `split` (fold assignment: 1..N)
+
+#### What the script expects
+
+For each dataset, you provide:
+
+* `--bids-roots`: path(s) to BIDS dataset root(s)
+* `--layouts`: one per dataset (`long` or `cross`)
+* `--input-lists`: one per dataset (`preprocess_<dataset>.txt`)
+* `--dest-path-for-images`: where your **training artifacts** are expected to live (brain / segm / latent outputs)
+
+> The script **does not create** brain/segm/latent files — it only writes paths to them in the CSV.
+
+#### Arguments
+
+* `--bids-roots`
+  One or more BIDS roots (e.g., `/data/hc-bcp /data/hc-calgary-preschool`)
+
+* `--layouts`
+  One per dataset: `cross` or `long`
+
+* `--input-lists`
+  One per dataset: text files listing the images to include (one path per line)
+
+* `--age-units` *(optional)*
+  `m` = months, `y` = years (converted to months).
+  You can provide **one value** (applies to all) or **one per dataset**.
+
+* `--dest-path-for-images`
+  Base folder where model inputs are expected to be found:
+
+  * `{dest}/{sub[_ses]}_brain.nii.gz`
+  * `{dest}/{sub[_ses]}_segm.nii.gz`
+  * `{dest}/{sub[_ses]}_latent.npz`
+
+* `--out-csv` *(optional)*
+  Output CSV filename (default: `dataset.csv`)
+
+* `--folds` *(optional)*
+  Number of stratified folds (default: 5)
+
+* `--seed` *(optional)*
+  Seed for fold assignment (default: 42)
+
+<details>
+<summary><strong>📌 Example commands (click the triangle to expand)</strong></summary>
+
+#### Example A — single dataset (longitudinal)
+
+```bash
+python create_dataset_csv.py \
+  --bids-roots /home/andjela/joplin-intra-inter/hc-calgary-preschool \
+  --layouts long \
+  --input-lists preprocess_hc-calgary-preschool.txt \
+  --age-units y \
+  --dest-path-for-images /home/andjela/joplin-intra-inter/hc-calgary-preschool/derivatives/brainprep_export \
+  --out-csv hc-calgary-preschool_dataset.csv \
+  --folds 5 \
+  --seed 42
+```
+
+#### Example B — two datasets (both longitudinal)
+
+```bash
+python create_dataset_csv.py \
+  --bids-roots \
+    /home/andjela/joplin-intra-inter/hc-bcp \
+    /home/andjela/joplin-intra-inter/hc-calgary-preschool \
+  --layouts long long \
+  --input-lists \
+    preprocess_hc-bcp.txt \
+    preprocess_hc-calgary-preschool.txt \
+  --age-units y y \
+  --dest-path-for-images /scratch/$USER/training_inputs \
+  --out-csv combined_dataset.csv
+```
+
+#### Example C — mixed layouts (cross-sectional + longitudinal)
+
+```bash
+python create_dataset_csv.py \
+  --bids-roots \
+    /home/andjela/joplin-intra-inter/hc-ping \
+    /home/andjela/joplin-intra-inter/hc-calgary-preschool \
+  --layouts cross long \
+  --input-lists \
+    preprocess_hc-ping.txt \
+    preprocess_hc-calgary-preschool.txt \
+  --age-units m y \
+  --dest-path-for-images /scratch/$USER/training_inputs \
+  --out-csv mixed_layout_dataset.csv
+```
+
+</details>
+
+#### Output CSV example (columns)
+
+You’ll get one row per image (for longitudinal: usually multiple rows per subject):
+
+```text
+dataset,subject_id,image_uid,sex,age,age_bef_norm,image_path,segm_path,latent_path,split
+hc-calgary-preschool,sub-10001,ses-001,1,0.4123,36.125,"..._brain.nii.gz","..._segm.nii.gz","..._latent.npz",3
+...
+```
+
+---
+
+
+Afterwards it is ready for training!

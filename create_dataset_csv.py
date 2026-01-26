@@ -231,7 +231,7 @@ def load_sessions(root: Path, age_unit: str = "m") -> pd.DataFrame:
         Sessions dataframe with columns:
         ``participant_id``, ``session_id``, ``age_months`` (if age column exists).
     """
-    sfile = root / "sessions.tsv"
+    sfile = root / "sourcedata/sessions.tsv"
     if not sfile.exists():
         raise FileNotFoundError(f"Missing sessions.tsv: {sfile}")
 
@@ -412,7 +412,9 @@ def normalize_age_inplace(df: pd.DataFrame) -> None:
     -----
     Operates in-place.
     """
+    
     df["age_bef_norm"] = df["age"]
+    df["age_bef_norm"] = pd.to_numeric(df["age_bef_norm"], errors="coerce").round(3)
 
     ages = pd.to_numeric(df["age_bef_norm"], errors="coerce")
     min_a, max_a = ages.min(), ages.max()
