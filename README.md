@@ -7,7 +7,7 @@ This preprocessing tool follows the BIDS standard and writes all outputs directl
 
 Pipeline (per T1w structural volumes): 
 
-**SynthStrip → N4 → affine registration → SynthSeg → WhiteStripe intensity normalization**.
+**SynthStrip → N4 → affine registration to template → SynthSeg → WhiteStripe intensity normalization**.
 
 > Full usage + details (exclude rules, layouts, age filters, outputs) live in the GitHub pages documentation.
 
