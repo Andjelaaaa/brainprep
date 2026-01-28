@@ -2,14 +2,12 @@
 # brainprep 🧠
 Preprocessing for pediatric (1–7 yo) MRI brain data
 
-**brainprep** is a BIDS-derivatives preprocessing pipeline for pediatric structural MRI.
-All outputs are written directly into:
+This preprocessing follows the BIDS standard and writes all outputs directly into your dataset’s `derivatives/brainprep/` folder. It works with any BIDS-compliant dataset that provides an `exclude.yaml` file. After raw-image QC, the workflow runs in three steps and supports both cross-sectional and longitudinal datasets.
 
 
-<bids_root>/derivatives/brainprep/sub-*/ses-*/anat/
+Pipeline (per T1w): 
 
-
-Pipeline (per T1w): **SynthStrip → N4 → affine registration → SynthSeg → WhiteStripe intensity normalization**.
+**SynthStrip → N4 → affine registration → SynthSeg → WhiteStripe intensity normalization**.
 
 > Full usage + details (exclude rules, layouts, age filters, outputs) live in the documentation.
 
