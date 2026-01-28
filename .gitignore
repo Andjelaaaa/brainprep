@@ -1,5 +1,7 @@
 .vscode/
-docs/
+docs/build/
+docs/.doctrees/
+docs/.buildinfo
 all_datasets_updated.csv
 to_preprocess_T1w.txt
 all_datasets.csv
