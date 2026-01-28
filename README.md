@@ -9,7 +9,7 @@ Pipeline (per T1w structural volumes):
 
 **SynthStrip → N4 → affine registration to template → SynthSeg → WhiteStripe intensity normalization**.
 
-> Full usage + details (exclude rules, layouts, age filters, outputs) live in the GitHub pages documentation.
+> Full usage + details (exclude rules, layouts, age filters, outputs) live in the [documentation](https://andjelaaaa.github.io/brainprep/).
 
 ---
 
