@@ -1,15 +1,13 @@
-```markdown
+
 # brainprep 🧠
 Preprocessing for pediatric (1–7 yo) MRI brain data
 
 **brainprep** is a BIDS-derivatives preprocessing pipeline for pediatric structural MRI.
 All outputs are written directly into:
 
-```
 
 <bids_root>/derivatives/brainprep/sub-*/ses-*/anat/
 
-````
 
 Pipeline (per T1w): **SynthStrip → N4 → affine registration → SynthSeg → WhiteStripe intensity normalization**.
 
