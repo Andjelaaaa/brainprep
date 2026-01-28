@@ -9,7 +9,7 @@ Pipeline (per T1w structural volumes):
 
 **SynthStrip → N4 → affine registration → SynthSeg → WhiteStripe intensity normalization**.
 
-> Full usage + details (exclude rules, layouts, age filters, outputs) live in the documentation.
+> Full usage + details (exclude rules, layouts, age filters, outputs) live in the GitHub pages documentation.
 
 ---
 
@@ -49,7 +49,7 @@ python brainprep.py \
   --inputs to_preprocess.txt \
   --template /path/to/template.nii.gz \
   --bids-root /path/to/bids_root \
-  --dataset mydataset
+  --dataset mydataset_name
 ```
 
 ---
@@ -82,7 +82,7 @@ brainprep/
 
 ## Documentation
 
-## Authors
+## Author
 
 Andjela Dimitrijevic
 
