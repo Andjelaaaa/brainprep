@@ -1,8 +1,10 @@
 .vscode/
 docs/build/
 docs/.doctrees/
+rename_*
 docs/.buildinfo
 all_datasets_updated.csv
+*.csv
 to_preprocess_T1w.txt
 all_datasets.csv
 pixar-dataset.csv

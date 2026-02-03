@@ -43,6 +43,31 @@ from contextlib import redirect_stderr
 
 NPROC = os.cpu_count() or 1
 
+_STAGE_ORDER = {
+    "synthstrip": 0,
+    "n4": 1,
+    "reg": 2,
+    "synthseg": 3,
+    "intnorm": 4,
+}
+
+def should_run_step(step: str, start_from: str) -> bool:
+    return _STAGE_ORDER[step] >= _STAGE_ORDER[start_from]
+
+def pick_registration_input(bp: "BrainprepPaths") -> Path:
+    """
+    Prefer N4 if it exists, else synthstrip, else raw input.
+    """
+    if bp.n4.exists():
+        return bp.n4
+    if bp.synthstrip_img.exists():
+        return bp.synthstrip_img
+    return bp.input
+
+def reg_outputs_exist(bp: "BrainprepPaths") -> bool:
+    # Adjust if your transform extension can be .h5 sometimes
+    xfm_ok = bp.xfm.exists() or bp.xfm.with_suffix(".h5").exists()
+    return bp.warped.exists() and bp.warped_mask.exists() and xfm_ok
 
 # -----------------------------------------------------------------------------
 # Logging helper
@@ -133,10 +158,41 @@ def parse_bids_info(path: str) -> Tuple[str, Optional[str], Optional[str], Optio
 
     return dataset, sub_id, ses_id, run_id
 
-def intnorm_worker(bp: BrainprepPaths) -> None:
-        """Pool worker: run WhiteStripe + mask on one BrainprepPaths."""
+def intnorm_worker(bp: "BrainprepPaths") -> bool:
+    """
+    Pool worker: WhiteStripe normalize template-space image and mask it.
+    Returns True on success, False on failure.
+    """
+    try:
+        if not bp.warped.exists():
+            raise RuntimeError(f"Missing warped image: {bp.warped}")
+        if not bp.warped_mask.exists():
+            raise RuntimeError(f"Missing warped mask: {bp.warped_mask}")
+
         whitestripe_intnorm(bp.warped, bp.warped_mask, bp.intnorm)
         return True
+    except Exception as e:
+        print(f"[ERROR][intnorm] {bp.subject_id if hasattr(bp,'subject_id') else ''} {bp.input}: {e}")
+        return False
+
+
+def reg_type_to_desc(registration_type: str) -> str:
+    """
+    Map ANTs registration type flag to a desc label.
+
+    t -> translation
+    r -> rigid
+    a -> affine
+    """
+    rt = (registration_type or "").lower()
+    if rt == "t":
+        return "translation"
+    if rt == "r":
+        return "rigid"
+    if rt == "a":
+        return "affine"
+    raise ValueError(f"Unknown registration_type={registration_type!r} (expected: t, r, a)")
+
 
 @dataclass(frozen=True)
 class BrainprepPaths:
@@ -164,8 +220,12 @@ class BrainprepPaths:
 
     intnorm: Path
 
-
-def make_brainprep_paths(input_nifti: str, bids_root: str, template_path: str) -> BrainprepPaths:
+def make_brainprep_paths(
+    input_nifti: str,
+    bids_root: str,
+    template_path: str,
+    registration_type: str = "a",
+) -> BrainprepPaths:
     """
     Create BIDS-derivatives paths under derivatives/brainprep.
 
@@ -173,16 +233,17 @@ def make_brainprep_paths(input_nifti: str, bids_root: str, template_path: str) -
     -----
     - Keeps run entity if present in input path.
     - `space` label is derived from template basename (sanitized).
-    - Creates anat_dir and work_dir.
+    - Adds `desc-<registration>` (translation|rigid|affine) from the warp step onward,
+      including SynthSeg outputs and intnorm.
     """
     _, sub_id, ses_id, run_id = parse_bids_info(input_nifti)
     sub_id = sub_id or "sub-UNKNOWN"
     ses_id = ses_id or "ses-UNKNOWN"
 
     template_base = get_template_name(template_path)
-    # If you prefer a shorter label, you can split on '_' here:
-    # space_raw = template_base.split("_")[0]
     space = sanitize_entity(template_base)
+
+    reg_desc = reg_type_to_desc(registration_type)
 
     deriv_root = Path(bids_root) / "derivatives" / "brainprep"
     anat_dir = deriv_root / sub_id / ses_id / "anat"
@@ -193,21 +254,26 @@ def make_brainprep_paths(input_nifti: str, bids_root: str, template_path: str) -
     run_part = f"_{run_id}" if run_id else ""
     base = f"{sub_id}_{ses_id}{run_part}"
 
+    # --- Pre-template-space steps (keep as-is) ---
     synthstrip_img = anat_dir / f"{base}_desc-synthstrip_T1w.nii.gz"
     synthstrip_mask = anat_dir / f"{base}_desc-synthstrip_mask.nii.gz"
     n4 = anat_dir / f"{base}_desc-n4_T1w.nii.gz"
 
-    warped = anat_dir / f"{base}_space-{space}_desc-affine_T1w.nii.gz"
-    warped_mask = anat_dir / f"{base}_space-{space}_desc-affine_mask.nii.gz"
+    # --- Template-space outputs: add desc-{reg_desc} consistently ---
+    warped = anat_dir / f"{base}_space-{space}_desc-{reg_desc}_T1w.nii.gz"
+    warped_mask = anat_dir / f"{base}_space-{space}_desc-{reg_desc}_mask.nii.gz"
 
-    # default expected transform name (we’ll write .mat or .h5 depending on ANTs)
-    xfm = anat_dir / f"{base}_from-T1w_to-{space}_mode-image_xfm.mat"
+    # Transform file: include reg_desc too (optional but consistent)
+    xfm = anat_dir / f"{base}_from-T1w_to-{space}_desc-{reg_desc}_mode-image_xfm.mat"
 
-    dseg = anat_dir / f"{base}_space-{space}_desc-synthseg_dseg.nii.gz"
-    qc = anat_dir / f"{base}_space-{space}_desc-synthseg_qc.tsv"
-    vol = anat_dir / f"{base}_space-{space}_desc-synthseg_vol.tsv"
+    # SynthSeg outputs: include reg_desc too
+    dseg = anat_dir / f"{base}_space-{space}_desc-{reg_desc}-synthseg_dseg.nii.gz"
+    qc   = anat_dir / f"{base}_space-{space}_desc-{reg_desc}-synthseg_qc.tsv"
+    vol  = anat_dir / f"{base}_space-{space}_desc-{reg_desc}-synthseg_vol.tsv"
 
-    intnorm = anat_dir / f"{base}_space-{space}_desc-intnorm_T1w.nii.gz"
+
+    # Intensity normalization: include reg_desc too
+    intnorm = anat_dir / f"{base}_space-{space}_desc-{reg_desc}-intnorm_T1w.nii.gz"
 
     return BrainprepPaths(
         input=Path(input_nifti),
@@ -228,6 +294,7 @@ def make_brainprep_paths(input_nifti: str, bids_root: str, template_path: str) -
         vol=vol,
         intnorm=intnorm,
     )
+
 
 
 # -----------------------------------------------------------------------------
@@ -272,7 +339,7 @@ def run_n4(inp: Path, out: Path, shrink_factor: int, *, quiet: bool = True) -> N
         raise RuntimeError(f"N4 failed: {inp}")
 
 
-def run_affine_registration(moving: Path, fixed: Path, prefix: Path, threads: int, regtype: str, *, quiet: bool = True) -> Tuple[Path, Path]:
+def run_registration(moving: Path, fixed: Path, prefix: Path, threads: int, regtype: str, *, quiet: bool = True) -> Tuple[Path, Path]:
     """
     Run antsRegistrationSyNQuick.sh.
 
@@ -308,6 +375,80 @@ def run_affine_registration(moving: Path, fixed: Path, prefix: Path, threads: in
         return warped, h5
     raise RuntimeError("Registration produced no affine (.mat) or composite (.h5) transform")
 
+def register_only(
+    paths: BrainprepPaths,
+    template: Path,
+    threads: int,
+    regtype: str,
+    template_mask: Optional[Path],
+    keep_work: bool,
+    quiet: bool,
+) -> BrainprepPaths:
+    """
+    Registration-only version of process_one().
+
+    - Does NOT run SynthStrip or N4.
+    - Picks the best available moving image:
+        n4 -> synthstrip_img -> raw input
+    - For mask in template space:
+        - if template_mask is provided: use it
+        - else: warp synthstrip_mask if it exists
+          (if no mask exists, we error because intnorm needs a mask)
+    """
+    # ---- pick moving image
+    if paths.n4.exists():
+        moving = paths.n4
+    elif paths.synthstrip_img.exists():
+        moving = paths.synthstrip_img
+    else:
+        moving = paths.input
+
+    # ---- registration
+    prefix = paths.work_dir / "tmpreg_"
+    warped_tmp, xfm_tmp = run_registration(
+        moving, template, prefix, threads, regtype, quiet=quiet
+    )
+
+    # Move warped to final name
+    if not paths.warped.exists():
+        shutil.move(str(warped_tmp), str(paths.warped))
+
+    # Move transform to final name (mat or h5)
+    xfm_to_apply = paths.xfm
+    if xfm_tmp.suffix == ".h5":
+        xfm_to_apply = paths.xfm.with_suffix(".h5")
+
+    if not xfm_to_apply.exists():
+        shutil.move(str(xfm_tmp), str(xfm_to_apply))
+
+    # ---- mask in template space
+    if template_mask is not None and template_mask.exists():
+        if not paths.warped_mask.exists():
+            try:
+                paths.warped_mask.symlink_to(template_mask)
+            except Exception:
+                shutil.copy2(template_mask, paths.warped_mask)
+    else:
+        # We need a subject-space mask to warp. Prefer synthstrip mask.
+        if not paths.synthstrip_mask.exists():
+            raise RuntimeError(
+                "Cannot create warped_mask without --template-mask or an existing synthstrip mask. "
+                "Either run SynthStrip first or pass --template-mask."
+            )
+        apply_transform_mask(
+            paths.synthstrip_mask, paths.warped, xfm_to_apply, paths.warped_mask, quiet=quiet
+        )
+
+    # ---- cleanup
+    if not keep_work:
+        try:
+            for p in paths.work_dir.glob("tmpreg_*"):
+                if p.is_file():
+                    p.unlink()
+        except Exception:
+            pass
+
+    return paths
 
 def apply_transform_mask(mask_subj: Path, ref_img: Path, xfm: Path, out_mask: Path, *, quiet: bool = True) -> None:
     """Transform subject-space mask into template space using nearest-neighbor."""
@@ -425,7 +566,7 @@ def process_one(paths: BrainprepPaths, template: Path, threads: int, shrinkf: in
     # Write ANTs intermediate products into work_dir
     prefix = paths.work_dir / "tmpreg_"
 
-    warped_tmp, xfm_tmp = run_affine_registration(paths.n4, template, prefix, threads, regtype, quiet=quiet)
+    warped_tmp, xfm_tmp = run_registration(paths.n4, template, prefix, threads, regtype, quiet=quiet)
 
     # Move warped to final name
     if not paths.warped.exists():
@@ -463,10 +604,99 @@ def process_one(paths: BrainprepPaths, template: Path, threads: int, shrinkf: in
     return paths
 
 
-def run_pipeline(bids_root: str, inputs: List[str], template: str, threads: int, shrinkf: int, regtype: str,
-                 no_bfc_list: Optional[set], template_mask: Optional[str], keep_work: bool, quiet: bool) -> None:
+# def run_pipeline(bids_root: str, inputs: List[str], template: str, threads: int, shrinkf: int, regtype: str,
+#                  no_bfc_list: Optional[set], template_mask: Optional[str], keep_work: bool, quiet: bool) -> None:
+#     """
+#     Full brainprep pipeline: steps 1-5.
+#     """
+#     template_p = Path(template)
+#     tmask_p = Path(template_mask) if template_mask else None
+
+#     # Build per-image paths
+#     all_paths: Dict[str, BrainprepPaths] = {}
+#     for p in inputs:
+#         if not Path(p).exists():
+#             print(f"[WARN] missing input: {p}")
+#             continue
+#         all_paths[p] = make_brainprep_paths(p, bids_root, template)
+
+#     # Steps 1-3 sequential (keeps external calls simpler to debug)
+#     ok_paths: List[BrainprepPaths] = []
+#     for inp, bp in tqdm(all_paths.items(), desc="SynthStrip/N4/Reg"):
+#         try:
+#             skip_n4 = (no_bfc_list is not None and inp in no_bfc_list)
+#             ok_paths.append(
+#                 process_one(
+#                     bp, template_p, threads, shrinkf, regtype,
+#                     skip_n4=skip_n4,
+#                     template_mask=tmask_p,
+#                     keep_work=keep_work,
+#                     quiet=quiet,
+#                 )
+#             )
+#         except Exception as e:
+#             print(f"[ERROR] {inp}: {e}")
+
+#     if not ok_paths:
+#         print("[!] No successful registrations; stopping.")
+#         return
+
+#     # Step 5 (your order in practice): SynthSeg
+#     seg_pairs: List[Tuple[Path, Path]] = []
+#     qc_paths: List[Path] = []
+#     vol_paths: List[Path] = []
+
+#     for bp in ok_paths:
+#         # choose input for synthseg:
+#         # - warped is template-space (consistent)
+#         inp_img = bp.warped
+#         if bp.dseg.exists():
+#             continue
+#         seg_pairs.append((inp_img, bp.dseg))
+#         qc_paths.append(bp.qc)
+#         vol_paths.append(bp.vol)
+
+#     if seg_pairs:
+#         run_synthseg_batch(seg_pairs, qc_paths, vol_paths, threads=threads, quiet=quiet)
+
+#     # Step 4 (your code runs intnorm in parallel): WhiteStripe + masked brain in template space
+#     # parallelize on the original input keys (we pass BrainprepPaths via closure)
+    
+
+#     with Pool(processes=threads) as pool:
+#         list(tqdm(pool.imap_unordered(intnorm_worker, ok_paths),
+#                 total=len(ok_paths), desc="IntensityNorm"))
+
+#     # Final sanity
+#     missing = [bp for bp in ok_paths if not bp.intnorm.exists()]
+#     if missing:
+#         print(f"[WARN] {len(missing)} intnorm outputs missing")
+#     print("✅ Finished all steps!")
+
+def run_pipeline(
+    bids_root: str,
+    inputs: List[str],
+    template: str,
+    threads: int,
+    shrinkf: int,
+    regtype: str,
+    no_bfc_list: Optional[set],
+    template_mask: Optional[str],
+    keep_work: bool,
+    quiet: bool,
+    start_from: str = "synthstrip",     # NEW
+    skip_existing: bool = False,        # NEW
+) -> None:
     """
     Full brainprep pipeline: steps 1-5.
+
+    Parameters
+    ----------
+    start_from:
+        One of: synthstrip, n4, reg, synthseg, intnorm.
+        Use 'reg' to skip SynthStrip/N4 and start at registration.
+    skip_existing:
+        If True, skip a step when its outputs already exist.
     """
     template_p = Path(template)
     tmask_p = Path(template_mask) if template_mask else None
@@ -477,13 +707,51 @@ def run_pipeline(bids_root: str, inputs: List[str], template: str, threads: int,
         if not Path(p).exists():
             print(f"[WARN] missing input: {p}")
             continue
-        all_paths[p] = make_brainprep_paths(p, bids_root, template)
+        all_paths[p] = make_brainprep_paths(p, bids_root, template, registration_type=regtype)
 
-    # Steps 1-3 sequential (keeps external calls simpler to debug)
+
     ok_paths: List[BrainprepPaths] = []
+
+    # --------------------------
+    # Steps 1-3: SynthStrip / N4 / Reg
+    # --------------------------
     for inp, bp in tqdm(all_paths.items(), desc="SynthStrip/N4/Reg"):
         try:
             skip_n4 = (no_bfc_list is not None and inp in no_bfc_list)
+
+            # If we start from reg: don't run synthstrip/n4, only ensure registration exists.
+            if start_from == "reg":
+                # Optionally skip registration if already done
+                if skip_existing and reg_outputs_exist(bp):
+                    ok_paths.append(bp)
+                    continue
+
+                # If you want strict behavior (require N4/synthstrip), enforce it here:
+                # if not bp.n4.exists(): raise RuntimeError("Missing N4 output; cannot start-from reg.")
+
+                # Run ONLY registration (you need a function that does reg only)
+                # If process_one() always runs synthstrip/n4 too, create a light wrapper:
+                bp = register_only(
+                    paths=bp,
+                    template=template_p,
+                    threads=threads,
+                    regtype=regtype,
+                    template_mask=tmask_p,
+                    keep_work=keep_work,
+                    quiet=quiet,
+                )
+
+                ok_paths.append(bp)
+                continue
+
+            # Otherwise: run your original process_one (SynthStrip+N4+Reg),
+            # but add skip-existing behavior inside process_one (recommended),
+            # OR do coarse skipping here:
+            if skip_existing and reg_outputs_exist(bp):
+                # already fully registered -> accept it
+                ok_paths.append(bp)
+                continue
+
             ok_paths.append(
                 process_one(
                     bp, template_p, threads, shrinkf, regtype,
@@ -491,8 +759,12 @@ def run_pipeline(bids_root: str, inputs: List[str], template: str, threads: int,
                     template_mask=tmask_p,
                     keep_work=keep_work,
                     quiet=quiet,
+                    # If you can modify process_one: pass start_from/skip_existing down:
+                    # start_from=start_from,
+                    # skip_existing=skip_existing,
                 )
             )
+
         except Exception as e:
             print(f"[ERROR] {inp}: {e}")
 
@@ -500,37 +772,49 @@ def run_pipeline(bids_root: str, inputs: List[str], template: str, threads: int,
         print("[!] No successful registrations; stopping.")
         return
 
-    # Step 5 (your order in practice): SynthSeg
+    # --------------------------
+    # SynthSeg (batch)
+    # --------------------------
     seg_pairs: List[Tuple[Path, Path]] = []
     qc_paths: List[Path] = []
     vol_paths: List[Path] = []
 
-    for bp in ok_paths:
-        # choose input for synthseg:
-        # - warped is template-space (consistent)
-        inp_img = bp.warped
-        if bp.dseg.exists():
-            continue
-        seg_pairs.append((inp_img, bp.dseg))
-        qc_paths.append(bp.qc)
-        vol_paths.append(bp.vol)
+    if should_run_step("synthseg", start_from):
+        for bp in ok_paths:
+            if not should_run_step("synthseg", start_from):
+                break
 
-    if seg_pairs:
-        run_synthseg_batch(seg_pairs, qc_paths, vol_paths, threads=threads, quiet=quiet)
+            if skip_existing and bp.dseg.exists() and bp.qc.exists() and bp.vol.exists():
+                continue
 
-    # Step 4 (your code runs intnorm in parallel): WhiteStripe + masked brain in template space
-    # parallelize on the original input keys (we pass BrainprepPaths via closure)
-    
+            seg_pairs.append((bp.warped, bp.dseg))
+            qc_paths.append(bp.qc)
+            vol_paths.append(bp.vol)
 
-    with Pool(processes=threads) as pool:
-        list(tqdm(pool.imap_unordered(intnorm_worker, ok_paths),
-                total=len(ok_paths), desc="IntensityNorm"))
+        if seg_pairs:
+            run_synthseg_batch(seg_pairs, qc_paths, vol_paths, threads=threads, quiet=quiet)
+
+    # --------------------------
+    # Intensity norm (parallel)
+    # --------------------------
+    if should_run_step("intnorm", start_from):
+        # Filter out those already done if resume mode
+        todo = ok_paths
+        if skip_existing:
+            todo = [bp for bp in ok_paths if not bp.intnorm.exists()]
+
+        if todo:
+            with Pool(processes=threads) as pool:
+                # If your intnorm_worker needs template_mask, you can wrap it or make it global.
+                list(tqdm(pool.imap_unordered(intnorm_worker, todo),
+                          total=len(todo), desc="IntensityNorm"))
 
     # Final sanity
-    missing = [bp for bp in ok_paths if not bp.intnorm.exists()]
+    missing = [bp for bp in ok_paths if should_run_step("intnorm", start_from) and not bp.intnorm.exists()]
     if missing:
         print(f"[WARN] {len(missing)} intnorm outputs missing")
     print("✅ Finished all steps!")
+
 
 
 # -----------------------------------------------------------------------------
@@ -570,7 +854,7 @@ def build_argparser() -> argparse.ArgumentParser:
 
     parser.add_argument("-t", "--threads", type=int, default=NPROC, help="Threads / processes (default: all cores)")
     parser.add_argument("-s", "--shrink-factor", type=int, default=4, help="N4 shrink factor (default=4)")
-    parser.add_argument("-r", "--registration-type", type=str, default="a", help="ANTS reg type {t,r,a} (default=a)")
+    parser.add_argument("-r", "--registration-type", type=str, default="a", help="ANTs registration type: t=translation, r=rigid, a=affine (default: a).")
 
     parser.add_argument("--no-bfc", type=str, default=None,
                         help="Text file with input paths for which to skip N4 (bias correction)")
@@ -580,6 +864,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--quiet", action="store_true", help="Suppress tool stdout/stderr")
 
     parser.add_argument("--dataset", type=str, default="dataset", help="Used for log filename only")
+    parser.add_argument("--start-from", choices=list(_STAGE_ORDER.keys()),
+                    default="synthstrip",
+                    help="Start pipeline from a given stage (synthstrip|n4|reg|synthseg|intnorm).")
+    parser.add_argument("--skip-existing", action="store_true",
+                    help="Skip steps whose outputs already exist.")
 
     return parser
 
@@ -608,6 +897,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 no_bfc_list=no_bfc_set,
                 template_mask=args.template_mask,
                 keep_work=args.keep_work,
+                start_from=args.start_from,
+                skip_existing=args.skip_existing,
                 quiet=args.quiet,
             )
             end_time = time.time()
