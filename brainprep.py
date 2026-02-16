@@ -22,6 +22,7 @@ Sphinx notes:
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import os
 import re
 import shutil
@@ -199,7 +200,7 @@ class BrainprepPaths:
     """All output paths for one input image."""
     input: Path
     sub_id: str
-    ses_id: str
+    ses_id: Optional[str]          # <- now optional
     run_id: Optional[str]
     space: str
 
@@ -212,7 +213,7 @@ class BrainprepPaths:
 
     warped: Path
     warped_mask: Path
-    xfm: Path  # .mat or .h5, chosen based on what ANTs outputs
+    xfm: Path
 
     dseg: Path
     qc: Path
@@ -238,7 +239,9 @@ def make_brainprep_paths(
     """
     _, sub_id, ses_id, run_id = parse_bids_info(input_nifti)
     sub_id = sub_id or "sub-UNKNOWN"
-    ses_id = ses_id or "ses-UNKNOWN"
+    
+    # If there is no session in the input path, keep it as None
+    ses_id = ses_id or None
 
     template_base = get_template_name(template_path)
     space = sanitize_entity(template_base)
@@ -246,13 +249,20 @@ def make_brainprep_paths(
     reg_desc = reg_type_to_desc(registration_type)
 
     deriv_root = Path(bids_root) / "derivatives" / "brainprep"
-    anat_dir = deriv_root / sub_id / ses_id / "anat"
-    work_dir = deriv_root / "work" / sub_id / ses_id
+    
+    subj_root = deriv_root / sub_id
+    if ses_id:
+        subj_root = subj_root / ses_id
+
+    anat_dir = subj_root / "anat"
+    work_dir = (deriv_root / "work" / sub_id / ses_id) if ses_id else (deriv_root / "work" / sub_id)
+
     anat_dir.mkdir(parents=True, exist_ok=True)
     work_dir.mkdir(parents=True, exist_ok=True)
 
     run_part = f"_{run_id}" if run_id else ""
-    base = f"{sub_id}_{ses_id}{run_part}"
+    ses_part = f"_{ses_id}" if ses_id else ""
+    base = f"{sub_id}{ses_part}{run_part}"
 
     # --- Pre-template-space steps (keep as-is) ---
     synthstrip_img = anat_dir / f"{base}_desc-synthstrip_T1w.nii.gz"
@@ -880,7 +890,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     inputs = read_inputs_list(args.inputs)
     no_bfc_set = read_no_bfc_list(args.no_bfc)
 
-    logfile = Path(f"preprocessing_log_{args.dataset}.txt")
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")  # e.g., 2026-02-12_14-03-59
+    logfile = Path(f"preprocessing_log_{args.dataset}_{ts}.txt")
     tee = TeeLogger(logfile)
 
     start_time = time.time()
