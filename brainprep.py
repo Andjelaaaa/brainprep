@@ -154,7 +154,7 @@ def parse_bids_info(path: str) -> Tuple[str, Optional[str], Optional[str], Optio
     m = re.search(r"(ses-[^/]+)", path)
     ses_id = m.group(1) if m else None
 
-    m = re.search(r"(run-[^/]+)", path)
+    m = re.search(r"(run-\d+)", path)
     run_id = m.group(1) if m else None
 
     return dataset, sub_id, ses_id, run_id
