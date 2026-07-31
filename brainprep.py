@@ -305,6 +305,14 @@ def make_brainprep_paths(
         intnorm=intnorm,
     )
 
+def infer_bids_root(input_path: str) -> str:
+    p = Path(input_path).resolve()
+    parts = p.parts
+    for i, part in enumerate(parts):
+        if part.startswith("sub-"):
+            print('PATH', str(Path(*parts[:i])))
+            return str(Path(*parts[:i]))
+    raise ValueError(f"Could not infer BIDS root from: {input_path}")
 
 
 # -----------------------------------------------------------------------------
@@ -684,7 +692,6 @@ def process_one(paths: BrainprepPaths, template: Path, threads: int, shrinkf: in
 #     print("✅ Finished all steps!")
 
 def run_pipeline(
-    bids_root: str,
     inputs: List[str],
     template: str,
     threads: int,
@@ -717,8 +724,14 @@ def run_pipeline(
         if not Path(p).exists():
             print(f"[WARN] missing input: {p}")
             continue
-        all_paths[p] = make_brainprep_paths(p, bids_root, template, registration_type=regtype)
 
+        inferred_root = infer_bids_root(p)
+        all_paths[p] = make_brainprep_paths(
+            p,
+            inferred_root,
+            template,
+            registration_type=regtype,
+        )
 
     ok_paths: List[BrainprepPaths] = []
 
@@ -860,7 +873,7 @@ def build_argparser() -> argparse.ArgumentParser:
 
     parser.add_argument("--inputs", required=True, help="Text file with paths to T1w images (one per line)")
     parser.add_argument("--template", required=True, help="Template image for antsRegistrationSyNQuick.sh")
-    parser.add_argument("--bids-root", required=True, help="BIDS dataset root (contains sub-*/ and derivatives/)")
+    # parser.add_argument("--bids-root", required=True, help="BIDS dataset root (contains sub-*/ and derivatives/)")
 
     parser.add_argument("-t", "--threads", type=int, default=NPROC, help="Threads / processes (default: all cores)")
     parser.add_argument("-s", "--shrink-factor", type=int, default=4, help="N4 shrink factor (default=4)")
@@ -899,7 +912,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     with redirect_stderr(tee):
         try:
             run_pipeline(
-                bids_root=args.bids_root,
                 inputs=inputs,
                 template=args.template,
                 threads=args.threads,

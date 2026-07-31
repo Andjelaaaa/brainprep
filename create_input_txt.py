@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import re
 import fnmatch
 import glob
 import os
@@ -73,6 +74,17 @@ def _norm_sub(s: str) -> str:
     s = str(s).strip().strip('"').strip("'")
     return s if s.startswith("sub-") else f"sub-{s}"
 
+def _subject_from_scan_id(scan_id: str) -> str:
+    """
+    Extract the subject folder from a scan id like:
+      sub-1030_run-03_T1w   -> sub-1030
+      sub-CTL_05_run-04_T1w -> sub-CTL_05
+      sub-CTL_14_T1w        -> sub-CTL_14
+    """
+    m = re.match(r"^(sub-.+?)(?:_run-[^_]+)?_(T1w|T2w)$", scan_id)
+    if not m:
+        raise ValueError(f"Cannot parse subject from exclude id: {scan_id}")
+    return m.group(1)
 
 def _norm_ses(s: Union[str, int, float, None]) -> Optional[str]:
     """Normalize a session label into ``ses-XX`` (numeric) or ``ses-<str>``."""
@@ -359,20 +371,24 @@ def process_dir(
     yaml_file = os.path.join(root, "code", "qc", "raw", scan_args.exclude_file)
     raw = load_excludes(yaml_file) if os.path.exists(yaml_file) else []
 
-    runs = [e for e in raw if "_run-" in e]
-    gens = [e for e in raw if "_run-" not in e]
-    patterns = expand_excludes(gens)
+    patterns = []
 
-    # Add run-level exact patterns
-    for run_id in runs:
-        session_key, _ = run_id.rsplit("_run-", 1)
-        session_path = session_key.replace("_ses-", "/ses-")
+    for e in raw:
+        e = e.strip().replace(os.sep, "/")
 
-        if scan_args.modality in ("T1w", "T2w"):
-            pat = f"{session_path}/anat/{run_id}_{scan_args.modality}.nii.gz"
+        if scan_args.modality in ("T1w", "T2w") and e.endswith(f"_{scan_args.modality}"):
+            if "_ses-" in e:
+                # long layout
+                sub, rest = e.split("_ses-", 1)
+                ses = "ses-" + rest.split("_", 1)[0]
+                pat = f"{sub}/{ses}/anat/{e}.nii.gz"
+            else:
+                # cross layout
+                sub = _subject_from_scan_id(e)
+                pat = f"{sub}/anat/{e}.nii.gz"
+            patterns.append(pat)
         else:
-            pat = f"**/{run_id}_*.nii.gz"
-        patterns.append(pat)
+            patterns.extend(expand_excludes([e]))
 
     found: Set[str] = set()
 
